@@ -2,13 +2,20 @@ package oauth
 
 import "strings"
 
-// BuildClickHouseHeaders returns the headers MCP forwards to ClickHouse under
-// forward mode: just the bearer wrapped as `Authorization: Bearer <token>`.
-// Gating mode does not flow through this helper — its CH credentials are
-// conveyed via the Basic header assembled by clickhouse-go from
+// BuildClickHouseHeaders returns the headers MCP forwards to ClickHouse for the
+// Bearer wire format: just the bearer wrapped as `Authorization: Bearer <token>`.
+//
+// Both forward mode and broker mode use this. Under broker:true the CH auth
+// method (Bearer vs Basic) is auto-detected by probing Bearer first; if this
+// helper returned nil for broker mode, that probe would carry NO Authorization
+// header, ClickHouse would fall back to the `default` user (REQUIRED_PASSWORD /
+// AUTHENTICATION_FAILED), and the Bearer probe could never succeed against a
+// token_processor backend — silently forcing every broker deployment onto the
+// Basic path. Pure gating (no broker) does not flow through this helper; its CH
+// credentials are conveyed via the Basic header assembled by clickhouse-go from
 // Auth.Username/Auth.Password.
 func BuildClickHouseHeaders(cfg OAuthConfig, token string) map[string]string {
-	if !cfg.IsForwardMode() {
+	if !cfg.IsForwardMode() && !cfg.Broker {
 		return nil
 	}
 	return map[string]string{
