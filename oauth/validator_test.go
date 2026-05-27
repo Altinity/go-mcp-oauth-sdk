@@ -9,7 +9,7 @@ import (
 )
 
 // TestValidateToken_OpaqueBearer_StrictJWTOnly exercises the StrictJWTOnly
-// flag's effect on an opaque (non-JWT) bearer in forward mode:
+// flag's effect on an opaque (non-JWT) bearer:
 //   - Default (StrictJWTOnly=false): soft-pass — nil claims, nil error.
 //   - StrictJWTOnly=true: hard reject with ErrInvalidToken.
 func TestValidateToken_OpaqueBearer_StrictJWTOnly(t *testing.T) {
@@ -19,7 +19,6 @@ func TestValidateToken_OpaqueBearer_StrictJWTOnly(t *testing.T) {
 	t.Run("soft-pass when StrictJWTOnly=false", func(t *testing.T) {
 		v := NewVerifier(OAuthConfig{
 			Enabled:       true,
-			Mode:          "forward",
 			StrictJWTOnly: false,
 		})
 		claims, err := v.ValidateToken(context.Background(), opaque)
@@ -30,7 +29,6 @@ func TestValidateToken_OpaqueBearer_StrictJWTOnly(t *testing.T) {
 	t.Run("reject when StrictJWTOnly=true", func(t *testing.T) {
 		v := NewVerifier(OAuthConfig{
 			Enabled:       true,
-			Mode:          "forward",
 			StrictJWTOnly: true,
 		})
 		claims, err := v.ValidateToken(context.Background(), opaque)

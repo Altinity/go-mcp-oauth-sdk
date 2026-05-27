@@ -2,11 +2,9 @@ package oauth
 
 import "testing"
 
-// TestBuildClickHouseHeaders pins the Bearer-header wire format across modes.
-// Regression guard: broker:true must emit the Authorization header so the
-// CH-auth auto-detect's Bearer probe carries the token (otherwise CH falls back
-// to the `default` user and the probe can never succeed — silently forcing
-// every broker deployment onto the Basic path).
+// TestBuildClickHouseHeaders pins the Bearer-header wire format. The SDK
+// returns the header whenever the caller asks for Bearer auth; host services
+// decide whether to use Bearer or another ClickHouse auth method.
 func TestBuildClickHouseHeaders(t *testing.T) {
 	const tok = "tok123"
 	cases := []struct {
@@ -14,15 +12,17 @@ func TestBuildClickHouseHeaders(t *testing.T) {
 		cfg      OAuthConfig
 		wantBear bool
 	}{
-		{"forward mode", OAuthConfig{Mode: "forward"}, true},
-		{"broker:true", OAuthConfig{Broker: true}, true},
-		{"broker:true + gating mode", OAuthConfig{Mode: "gating", Broker: true}, true},
-		{"pure gating (no broker)", OAuthConfig{Mode: "gating"}, false},
-		{"unset mode, no broker", OAuthConfig{}, false},
+		{"default config", OAuthConfig{}, true},
+		{"broker true", OAuthConfig{Broker: true}, true},
+		{"empty token", OAuthConfig{Broker: true}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := BuildClickHouseHeaders(tc.cfg, tok)
+			token := tok
+			if tc.name == "empty token" {
+				token = " "
+			}
+			h := BuildClickHouseHeaders(tc.cfg, token)
 			got, ok := h["Authorization"]
 			if tc.wantBear {
 				if !ok || got != "Bearer "+tok {

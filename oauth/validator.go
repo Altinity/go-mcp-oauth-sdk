@@ -26,20 +26,15 @@ func ExtractTokenFromRequest(r *http.Request) string {
 }
 
 // RequiresLocalValidation reports whether the auth layer should call
-// ValidateToken on inbound bearers. We always do, in both gating and forward
-// modes — ValidateToken itself decides what kind of validation applies for
-// the configured mode and token shape.
+// ValidateToken on inbound bearers.
 func (v *Verifier) RequiresLocalValidation() bool {
 	return v.cfg.Enabled
 }
 
 // ValidateToken validates an OAuth bearer and returns claims.
 //
-// Both modes route through the JWKS-based external-JWT validator: under
-// gating, MCP is a pure resource server and the bearer is an upstream IdP
-// (Auth0) access token; under forward, MCP proxies the upstream IdP token to
-// the client unchanged. In both cases local validation is signature + iss +
-// aud + exp against the configured JWKS.
+// JWT bearers route through the JWKS-based external-JWT validator:
+// signature + iss + aud + exp against the configured JWKS.
 //
 // Two cases soft-pass (return nil claims, nil error) — the auth layer accepts
 // the request and forwards to ClickHouse, which is then the sole validator:
@@ -49,9 +44,8 @@ func (v *Verifier) RequiresLocalValidation() bool {
 //  2. JWT bearers with neither Issuer nor JWKSURL configured — operator
 //     hasn't told us where to fetch verification keys.
 //
-// Soft-pass preserves compatibility with deployments that pre-date C-1 and
-// rely entirely on ClickHouse-side validation. See docs/oauth_next_refactor.md
-// for the plan to remove soft-pass once token introspection lands.
+// Soft-pass preserves compatibility with deployments that rely entirely on
+// downstream validation. Set StrictJWTOnly to reject opaque bearers locally.
 func (v *Verifier) ValidateToken(ctx context.Context, token string) (*Claims, error) {
 	if !v.cfg.Enabled {
 		return nil, nil
@@ -61,26 +55,21 @@ func (v *Verifier) ValidateToken(ctx context.Context, token string) (*Claims, er
 		return nil, ErrMissingToken
 	}
 
-	mode := v.cfg.NormalizedMode()
 	if !looksLikeJWT(token) {
-		if v.cfg.IsGatingMode() {
-			log.Error().Str("mode", mode).Msg("OAuth token is not a JWT; gating mode requires a signed JWT from the upstream AS")
-			return nil, ErrInvalidToken
-		}
 		if v.cfg.StrictJWTOnly {
-			log.Error().Str("mode", mode).Msg("OAuth token is not a JWT; StrictJWTOnly rejects opaque bearers")
+			log.Error().Msg("OAuth token is not a JWT; StrictJWTOnly rejects opaque bearers")
 			return nil, ErrInvalidToken
 		}
-		log.Debug().Str("mode", mode).Msg("Bearer is opaque (not a JWT); skipping local validation, deferring to ClickHouse")
+		log.Debug().Msg("Bearer is opaque (not a JWT); skipping local validation")
 		return nil, nil
 	}
 	if strings.TrimSpace(v.cfg.JWKSURL) == "" && strings.TrimSpace(v.cfg.Issuer) == "" {
-		log.Debug().Str("mode", mode).Msg("JWT received but neither oauth_issuer nor jwks_url is configured; skipping local validation")
+		log.Debug().Msg("JWT received but neither oauth_issuer nor jwks_url is configured; skipping local validation")
 		return nil, nil
 	}
 	claims, err := v.parseAndVerifyExternalJWT(ctx, token, v.cfg.Audience)
 	if err != nil {
-		log.Error().Err(err).Str("mode", mode).Msg("Failed to validate OAuth token")
+		log.Error().Err(err).Msg("Failed to validate OAuth token")
 		return nil, err
 	}
 

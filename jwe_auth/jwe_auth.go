@@ -251,7 +251,7 @@ func validateClaimsWhitelist(claims map[string]interface{}) error {
 		"tls_client_key":           true,
 		"tls_insecure_skip_verify": true,
 
-		// OAuth gating/client registration claims
+		// OAuth broker/client registration claims
 		"grant_type":                 true,
 		"redirect_uris":              true,
 		"token_endpoint_auth_method": true,

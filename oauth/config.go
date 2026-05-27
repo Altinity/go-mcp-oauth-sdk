@@ -1,9 +1,6 @@
 package oauth
 
-import (
-	"strings"
-	"time"
-)
+import "time"
 
 // OAuthConfig defines configuration for OAuth 2.0 authentication.
 //
@@ -12,12 +9,6 @@ import (
 // secrets like SigningSecret can be injected from a Kubernetes Secret via
 // the Helm chart's env: array using valueFrom.secretKeyRef.
 type OAuthConfig struct {
-	// Mode controls whether altinity-mcp forwards external OAuth bearers or gates them into local MCP tokens.
-	// "forward" is the production path: pass the end-user bearer through to ClickHouse.
-	// "gating" keeps the built-in limited OAuth facade that issues its own tokens.
-	// Deprecated: use broker: true instead. mode is retained for backward compatibility.
-	Mode string `json:"mode" yaml:"mode" flag:"oauth-mode" env:"MCP_OAUTH_MODE" desc:"Deprecated: use broker: true instead. OAuth operating mode (forward/gating)."`
-
 	// Enabled enables OAuth authentication
 	Enabled bool `json:"enabled" yaml:"enabled" flag:"oauth-enabled" env:"MCP_OAUTH_ENABLED" desc:"Enable OAuth 2.0 authentication"`
 
@@ -58,7 +49,7 @@ type OAuthConfig struct {
 	// Scopes is the list of OAuth scopes to request
 	Scopes []string `json:"scopes" yaml:"scopes" flag:"oauth-scopes" env:"MCP_OAUTH_SCOPES" desc:"OAuth scopes to request"`
 
-	// UpstreamOfflineAccess opts forward/broker mode into appending
+	// UpstreamOfflineAccess opts broker mode into appending
 	// `offline_access` to the scope sent upstream. Used mainly so the IdP's
 	// consent screen offers long-lived sessions; the upstream refresh token
 	// MCP receives is currently discarded. v1 issues NO downstream refresh
@@ -78,28 +69,12 @@ type OAuthConfig struct {
 	// client). Default false avoids the surprise re-consent on every login.
 	UpstreamForceConsent bool `json:"upstream_force_consent" yaml:"upstream_force_consent" flag:"oauth-upstream-force-consent" env:"MCP_OAUTH_UPSTREAM_FORCE_CONSENT" desc:"Force prompt=consent on every upstream /authorize (Google providers only). Default false reuses Google's stored offline-access grant after the first consent."`
 
-	// BrokerUpstream opts gating mode into the broker pattern that forward
-	// mode uses by default. When true under gating mode, altinity-mcp:
-	//   - Acts as the OAuth AS to claude.ai/ChatGPT (hosts /oauth/{authorize,
-	//     callback,token}, accepts CIMD client_ids).
-	//   - Brokers an upstream IdP using a static OAuth application
-	//     (ClientID/ClientSecret/AuthURL/TokenURL config).
-	//   - Returns the upstream id_token unchanged as the access_token to
-	//     the MCP client. At query time MCP rewrites the bearer to
-	//     `Authorization: Basic base64(email:JWT)` and the CH-side
-	//     ch-jwt-verify sidecar validates it cryptographically.
-	// Use when the upstream IdP does not support CIMD natively (e.g. Google
-	// directly). Default false: gating accepts CIMD-published clients directly
-	// from MCP clients (claude.ai, ChatGPT).
-	// Deprecated: use Broker instead.
-	BrokerUpstream bool `json:"broker_upstream" yaml:"broker_upstream" flag:"oauth-broker-upstream" env:"MCP_OAUTH_BROKER_UPSTREAM" desc:"Deprecated: use broker: true instead. Gating mode: enable broker pattern (act as AS to clients, broker upstream IdP)."`
-
 	// Broker enables altinity-mcp to act as the OAuth AS to MCP clients
 	// (CIMD, /authorize + /callback + /token) while brokering an upstream IdP
-	// that does not support CIMD natively (e.g. Google). Replaces the combination
-	// of mode:forward and mode:gating+broker_upstream:true. When set,
-	// mode/broker_upstream are ignored; CH auth wire format (Bearer vs Basic)
-	// is auto-detected on first request per endpoint and cached.
+	// that does not support CIMD natively (e.g. Google). When false, MCP is
+	// only a protected resource and the external authorization server handles
+	// client authorization. CH auth wire format (Bearer vs Basic) is a host
+	// service detail, not an SDK config mode.
 	// Requires: issuer, client_id, client_secret, auth_url, token_url, signing_secret.
 	Broker bool `json:"broker" yaml:"broker" flag:"oauth-broker" env:"MCP_OAUTH_BROKER" desc:"Enable OAuth broker: MCP acts as AS to MCP clients, brokers upstream IdP. CH auth (Bearer/Basic) auto-detected per endpoint."`
 
@@ -137,32 +112,6 @@ type OAuthConfig struct {
 	SigningSecret string `json:"signing_secret" yaml:"signing_secret" flag:"oauth-signing-secret" env:"MCP_OAUTH_SIGNING_SECRET" desc:"Server-side HKDF master secret for OAuth JWE artifacts (pending-auth state, downstream auth codes). Required when broker: true."`
 
 	// StrictJWTOnly rejects non-JWT bearer tokens with ErrInvalidToken
-	// instead of soft-passing them. Default false (mcp/forward-mode behavior).
+	// instead of soft-passing them. Default false.
 	StrictJWTOnly bool `yaml:"strict_jwt_only" json:"strict_jwt_only"`
-}
-
-// NormalizedMode returns the OAuth mode lowercased and trimmed; empty input
-// defaults to "gating".
-func (cfg OAuthConfig) NormalizedMode() string {
-	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
-	switch mode {
-	case "forward":
-		return "forward"
-	case "gating":
-		return "gating"
-	case "":
-		return "gating"
-	default:
-		return mode
-	}
-}
-
-// IsForwardMode reports whether the configured mode is "forward".
-func (cfg OAuthConfig) IsForwardMode() bool {
-	return cfg.NormalizedMode() == "forward"
-}
-
-// IsGatingMode reports whether the configured mode is "gating" (or unset).
-func (cfg OAuthConfig) IsGatingMode() bool {
-	return cfg.NormalizedMode() == "gating"
 }
