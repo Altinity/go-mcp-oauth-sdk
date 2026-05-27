@@ -15,7 +15,8 @@ type OAuthConfig struct {
 	// Mode controls whether altinity-mcp forwards external OAuth bearers or gates them into local MCP tokens.
 	// "forward" is the production path: pass the end-user bearer through to ClickHouse.
 	// "gating" keeps the built-in limited OAuth facade that issues its own tokens.
-	Mode string `json:"mode" yaml:"mode" flag:"oauth-mode" env:"MCP_OAUTH_MODE" desc:"OAuth operating mode (forward/gating)"`
+	// Deprecated: use broker: true instead. mode is retained for backward compatibility.
+	Mode string `json:"mode" yaml:"mode" flag:"oauth-mode" env:"MCP_OAUTH_MODE" desc:"Deprecated: use broker: true instead. OAuth operating mode (forward/gating)."`
 
 	// Enabled enables OAuth authentication
 	Enabled bool `json:"enabled" yaml:"enabled" flag:"oauth-enabled" env:"MCP_OAUTH_ENABLED" desc:"Enable OAuth 2.0 authentication"`
@@ -90,7 +91,17 @@ type OAuthConfig struct {
 	// Use when the upstream IdP does not support CIMD natively (e.g. Google
 	// directly). Default false: gating accepts CIMD-published clients directly
 	// from MCP clients (claude.ai, ChatGPT).
-	BrokerUpstream bool `json:"broker_upstream" yaml:"broker_upstream" flag:"oauth-broker-upstream" env:"MCP_OAUTH_BROKER_UPSTREAM" desc:"Gating mode: enable broker pattern (act as AS to clients, broker upstream IdP). Requires client_id/client_secret/auth_url/token_url/issuer to be set."`
+	// Deprecated: use Broker instead.
+	BrokerUpstream bool `json:"broker_upstream" yaml:"broker_upstream" flag:"oauth-broker-upstream" env:"MCP_OAUTH_BROKER_UPSTREAM" desc:"Deprecated: use broker: true instead. Gating mode: enable broker pattern (act as AS to clients, broker upstream IdP)."`
+
+	// Broker enables altinity-mcp to act as the OAuth AS to MCP clients
+	// (CIMD, /authorize + /callback + /token) while brokering an upstream IdP
+	// that does not support CIMD natively (e.g. Google). Replaces the combination
+	// of mode:forward and mode:gating+broker_upstream:true. When set,
+	// mode/broker_upstream are ignored; CH auth wire format (Bearer vs Basic)
+	// is auto-detected on first request per endpoint and cached.
+	// Requires: issuer, client_id, client_secret, auth_url, token_url, signing_secret.
+	Broker bool `json:"broker" yaml:"broker" flag:"oauth-broker" env:"MCP_OAUTH_BROKER" desc:"Enable OAuth broker: MCP acts as AS to MCP clients, brokers upstream IdP. CH auth (Bearer/Basic) auto-detected per endpoint."`
 
 	// RequiredScopes is the list of scopes required for access (token must have all of these)
 	RequiredScopes []string `json:"required_scopes" yaml:"required_scopes" flag:"oauth-required-scopes" env:"MCP_OAUTH_REQUIRED_SCOPES" desc:"Required OAuth scopes for access"`
@@ -121,10 +132,9 @@ type OAuthConfig struct {
 	// SigningSecret is the server-side symmetric secret used to HKDF-derive
 	// keys for every stateless OAuth JWE this server mints: pending-auth
 	// state (the upstream `state` parameter) and the downstream auth-code
-	// returned from /oauth/callback. Required whenever OAuth broker mode is
-	// active (forward, or gating + broker_upstream). Per #115 v1 issues no
-	// downstream refresh tokens and no DCR client_secrets.
-	SigningSecret string `json:"signing_secret" yaml:"signing_secret" flag:"oauth-signing-secret" env:"MCP_OAUTH_SIGNING_SECRET" desc:"Server-side HKDF master secret for OAuth JWE artifacts (pending-auth state, downstream auth codes). Required whenever broker mode is active."`
+	// returned from /oauth/callback. Required when Broker=true. Per #115
+	// v1 issues no downstream refresh tokens and no DCR client_secrets.
+	SigningSecret string `json:"signing_secret" yaml:"signing_secret" flag:"oauth-signing-secret" env:"MCP_OAUTH_SIGNING_SECRET" desc:"Server-side HKDF master secret for OAuth JWE artifacts (pending-auth state, downstream auth codes). Required when broker: true."`
 
 	// StrictJWTOnly rejects non-JWT bearer tokens with ErrInvalidToken
 	// instead of soft-passing them. Default false (mcp/forward-mode behavior).
