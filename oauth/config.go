@@ -114,4 +114,18 @@ type OAuthConfig struct {
 	// StrictJWTOnly rejects non-JWT bearer tokens with ErrInvalidToken
 	// instead of soft-passing them. Default false.
 	StrictJWTOnly bool `yaml:"strict_jwt_only" json:"strict_jwt_only"`
+
+	// RoleClaim names the JWT claim that holds a JSON array of ClickHouse role
+	// names (e.g. "https://clickhouse/roles"). When set, the host activates
+	// only the RoleFilter-matching subset of those roles per ClickHouse request
+	// (HTTP `role=` query params), narrowing the user's active roles. Empty
+	// disables the feature. The claim is read from Claims.Extra, so a
+	// namespaced custom claim works without any further wiring.
+	RoleClaim string `json:"role_claim" yaml:"role_claim" flag:"oauth-role-claim" env:"MCP_OAUTH_ROLE_CLAIM" desc:"JWT claim holding a JSON array of ClickHouse role names to activate per request (empty disables)"`
+
+	// RoleFilter is a regex; only role names from RoleClaim that match are
+	// activated. It is the safety net that stops a misconfigured or over-broad
+	// claim from activating real-data roles (e.g. "_mcp$"). Required when
+	// RoleClaim is set.
+	RoleFilter string `json:"role_filter" yaml:"role_filter" flag:"oauth-role-filter" env:"MCP_OAUTH_ROLE_FILTER" desc:"Regex selecting which role_claim roles are activated (required when role_claim is set)"`
 }
