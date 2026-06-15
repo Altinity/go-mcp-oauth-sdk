@@ -123,9 +123,10 @@ type OAuthConfig struct {
 	// namespaced custom claim works without any further wiring.
 	RoleClaim string `json:"role_claim" yaml:"role_claim" flag:"oauth-role-claim" env:"MCP_OAUTH_ROLE_CLAIM" desc:"JWT claim holding a JSON array of ClickHouse role names to activate per request (empty disables)"`
 
-	// RoleFilter is a regex; only role names from RoleClaim that match are
-	// activated. It is the safety net that stops a misconfigured or over-broad
-	// claim from activating real-data roles (e.g. "_mcp$"). Required when
-	// RoleClaim is set.
-	RoleFilter string `json:"role_filter" yaml:"role_filter" flag:"oauth-role-filter" env:"MCP_OAUTH_ROLE_FILTER" desc:"Regex selecting which role_claim roles are activated (required when role_claim is set)"`
+	// RoleFilter is an optional regex narrowing which RoleClaim roles are
+	// activated (e.g. "_mcp$"). When empty, every role in the claim is
+	// activated; when set, it stops a misconfigured/over-broad claim from
+	// activating real-data roles. Host enforcement decides empty-set behavior
+	// (altinity-mcp fails closed). Anchor it — it is a partial match.
+	RoleFilter string `json:"role_filter" yaml:"role_filter" flag:"oauth-role-filter" env:"MCP_OAUTH_ROLE_FILTER" desc:"Optional regex narrowing which role_claim roles are activated (empty = all claim roles)"`
 }
