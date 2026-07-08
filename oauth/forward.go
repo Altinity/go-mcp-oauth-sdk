@@ -34,3 +34,24 @@ func EmailFromNamespacedExtra(extra map[string]interface{}) string {
 	}
 	return ""
 }
+
+// UsernameFromExtra returns the string value of claimName from a raw JWT claim
+// map, looked up by exact top-level key. It returns ("", false) when claimName
+// is empty, the claim is missing, the value is not a string, or the value is
+// blank after trimming — callers fail closed on false. Like the other helpers
+// here it operates on the unverified decoded payload and yields only a Basic-
+// auth username hint; ClickHouse / the ch-jwt-verify sidecar still validate the
+// token.
+func UsernameFromExtra(raw map[string]interface{}, claimName string) (string, bool) {
+	if strings.TrimSpace(claimName) == "" {
+		return "", false
+	}
+	s, ok := raw[claimName].(string)
+	if !ok {
+		return "", false
+	}
+	if t := strings.TrimSpace(s); t != "" {
+		return t, true
+	}
+	return "", false
+}

@@ -129,4 +129,14 @@ type OAuthConfig struct {
 	// activating real-data roles. Host enforcement decides empty-set behavior
 	// (altinity-mcp fails closed). Anchor it — it is a partial match.
 	RoleFilter string `json:"role_filter" yaml:"role_filter" flag:"oauth-role-filter" env:"MCP_OAUTH_ROLE_FILTER" desc:"Optional regex narrowing which role_claim roles are activated (empty = all claim roles)"`
+
+	// UsernameClaim names the JWT claim whose string value is used as the
+	// ClickHouse Basic-auth username on the sidecar fallback path. Empty keeps
+	// the host's default behavior (email + namespaced */email fallback). When
+	// set, the host does a strict top-level lookup of this claim and fails
+	// closed if it is missing/empty/non-string — never silently falling back to
+	// another identity. The claim is an unverified hint only: ClickHouse /
+	// ch-jwt-verify still validate the JWT. Must match the sidecar's
+	// identity.username_claim.
+	UsernameClaim string `json:"username_claim" yaml:"username_claim" flag:"oauth-username-claim" env:"MCP_OAUTH_USERNAME_CLAIM" desc:"JWT claim used as the ClickHouse Basic-auth username on the sidecar path (empty = default email + namespaced fallback)"`
 }
