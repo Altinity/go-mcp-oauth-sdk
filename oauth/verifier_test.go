@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,6 +261,64 @@ func TestParseAndVerifyExternalJWTUnknownKid(t *testing.T) {
 	_, err = v.parseAndVerifyExternalJWT(context.Background(), token, "test-audience")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no JWK found for kid")
+}
+
+// TestParseAndVerifyExternalJWTMalformedTokenUnwrapDepth is a regression
+// test for a legacy-compatibility bug introduced alongside the
+// jwtHeaderParseError classification wrapper (oauth/jwt.go): before that
+// wrapper existed, parseAndFetchKeys' jwt.ParseSigned failure reached
+// parseAndVerifyExternalJWT's callers as a bare fmt.Errorf-wrapped go-jose
+// error, so a single errors.Unwrap() landed directly on the raw go-jose
+// error. The wrapper must stay internal to jwtHeaderParseError-aware
+// callers (ValidateStrictJWT) — parseAndVerifyExternalJWT must unwrap it
+// before returning, preserving the exact one-step-unwrap object graph its
+// existing callers depend on.
+func TestParseAndVerifyExternalJWTMalformedTokenUnwrapDepth(t *testing.T) {
+	t.Parallel()
+
+	v := NewVerifier(OAuthConfig{
+		Issuer:  "https://issuer.example.com",
+		JWKSURL: "https://issuer.example.com/jwks",
+	})
+
+	// HS256 isn't in signatureAlgorithms (oauth/jwt.go only accepts
+	// RS/ES/PS/EdDSA), so jwt.ParseSigned rejects this token immediately —
+	// before any JWKS fetch — exercising the same pre-signature parse
+	// failure jwtHeaderParseError wraps.
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.HS256, Key: []byte("some-shared-secret-key-32-bytes!")},
+		(&jose.SignerOptions{}).WithType("JWT"),
+	)
+	require.NoError(t, err)
+
+	object, err := signer.Sign([]byte(`{"sub":"user-1"}`))
+	require.NoError(t, err)
+	token, err := object.CompactSerialize()
+	require.NoError(t, err)
+
+	_, err = v.parseAndVerifyExternalJWT(context.Background(), token, "test-audience")
+	require.Error(t, err)
+
+	// The returned error itself must be the fmt.Errorf wrapper (exactly as
+	// it was before jwtHeaderParseError existed — see git show
+	// 461c410:oauth/jwt.go), not the jwtHeaderParseError classification
+	// wrapper introduced in e1ea2f6.
+	var headerParseErr *jwtHeaderParseError
+	require.False(t, errors.As(err, &headerParseErr),
+		"parseAndVerifyExternalJWT must not surface the jwtHeaderParseError wrapper to its callers")
+	require.True(t, strings.HasPrefix(err.Error(), "failed to parse signed JWT:"),
+		"returned error should be the fmt.Errorf wrapper directly, got: %s", err.Error())
+
+	// A single errors.Unwrap() must land directly on the raw go-jose parse
+	// error — the exact one-step-unwrap depth callers saw before this
+	// branch's changes — rather than on an intermediate jwtHeaderParseError
+	// level.
+	unwrapped := errors.Unwrap(err)
+	require.NotNil(t, unwrapped, "a single errors.Unwrap() must reach a non-nil error")
+	require.False(t, strings.HasPrefix(unwrapped.Error(), "failed to parse signed JWT:"),
+		"one-step errors.Unwrap() should skip straight past the fmt.Errorf wrapper to the raw go-jose error, got: %s", unwrapped.Error())
+	var headerParseErr2 *jwtHeaderParseError
+	require.False(t, errors.As(unwrapped, &headerParseErr2))
 }
 
 // TestJWKSRefetchOnKidMiss verifies that a kid absent from the cached JWKS
