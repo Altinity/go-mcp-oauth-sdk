@@ -404,14 +404,15 @@ func TestValidateStrictJWT_Expiry(t *testing.T) {
 		require.False(t, errors.Is(err, ErrTokenExpired), "a negative Leeway must be rejected as an invalid policy, not evaluated as an expiry")
 	})
 
-	// Sabotage case: revert the exp comparison in validateStrictRawClaims
-	// back to `nowUnix > expVal+leewaySecs`. exp = math.MinInt64 is an
-	// extreme value that strictNumericClaim's range check currently accepts
-	// as a boundary (not itself rejected as malformed). With a zero or
-	// positive Leeway this test proves the comparison itself doesn't
-	// overflow for any exp/leeway combination admitted by policy validation
-	// — i.e. the defense-in-depth hardening holds independently of the
-	// negative-Leeway rejection above.
+	// exp = math.MinInt64 with a non-negative Leeway: both the current
+	// `nowUnix-leewaySecs > expVal` comparison and the old, already-replaced
+	// `nowUnix > expVal+leewaySecs` form correctly classify this as expired
+	// (math.MinInt64+leewaySecs doesn't overflow int64 at any Leeway
+	// admitted by policy validation), so this case alone does NOT
+	// distinguish the two implementations — it only pins that the lower
+	// extreme is still handled correctly. See the "near the upper accepted
+	// boundary" case below for the overflow direction that actually
+	// distinguishes them.
 	t.Run("extreme exp boundary does not overflow the comparison with non-negative leeway", func(t *testing.T) {
 		t.Parallel()
 		idp := newStrictTestIdP(t)
@@ -425,6 +426,34 @@ func TestValidateStrictJWT_Expiry(t *testing.T) {
 			Leeway:            time.Minute,
 		})
 		require.ErrorIs(t, err, ErrTokenExpired, "an exp of math.MinInt64 must be treated as expired, never accepted via overflow")
+	})
+
+	// Sabotage case: revert the exp comparison in validateStrictRawClaims
+	// back to `nowUnix > expVal+leewaySecs`. Here exp sits near the *upper*
+	// accepted boundary (math.MaxInt64-1023, the closest value to 2^63 that
+	// strictNumericClaim's float64 range check still accepts and that a
+	// float64 can represent exactly) with a large positive Leeway. Under the
+	// old formula, expVal+leewaySecs overflows past math.MaxInt64 and wraps
+	// around to a large negative number, which makes `nowUnix >
+	// (wrapped negative)` true — misclassifying this legitimate, far-future
+	// token as already expired. The new formula computes nowUnix-leewaySecs
+	// instead (both sane, non-extreme magnitudes that can't overflow), so it
+	// correctly treats the token as not expired. This is the case that
+	// actually distinguishes the two implementations; the MinInt64 case
+	// above does not.
+	t.Run("extreme exp near the upper accepted boundary does not overflow with a large leeway", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = int64(math.MaxInt64 - 1023)
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Hour,
+		})
+		require.NoError(t, err, "a huge exp far in the future combined with a normal Leeway must not overflow into a false expiry")
 	})
 }
 
