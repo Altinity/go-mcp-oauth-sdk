@@ -598,21 +598,27 @@ func b64urlNoPad(b []byte) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// rawCompactJWTWithAlg hand-constructs a compact-serialized JWT whose header
-// carries an arbitrary alg value, without going through a jose.Signer (which
-// only accepts alg values from its own known-algorithm enum and would refuse
-// to build a token with an attacker-marker string in that field). go-jose's
-// jwt.ParseSigned parses and validates the header's alg membership before any
-// signature verification happens, so the third segment's content is
-// irrelevant here — it never gets checked when alg itself is already
-// rejected.
-func rawCompactJWTWithAlg(t *testing.T, alg string, claims map[string]interface{}) string {
+// rawCompactJWTWithHeader hand-constructs a compact-serialized JWT with an
+// arbitrary header map, without going through a jose.Signer (which only
+// accepts header values from its own known-shape enums and would refuse to
+// build a token with attacker-marker content in them). go-jose's
+// jwt.ParseSigned sanitizes and validates the header before any signature
+// verification happens, so the third segment's content is irrelevant here —
+// it never gets checked once the header itself is already rejected.
+func rawCompactJWTWithHeader(t *testing.T, header map[string]interface{}, claims map[string]interface{}) string {
 	t.Helper()
-	header, err := json.Marshal(map[string]interface{}{"alg": alg, "typ": "JWT"})
+	headerBytes, err := json.Marshal(header)
 	require.NoError(t, err)
 	payload, err := json.Marshal(claims)
 	require.NoError(t, err)
-	return b64urlNoPad(header) + "." + b64urlNoPad(payload) + "." + b64urlNoPad([]byte("not-a-real-signature"))
+	return b64urlNoPad(headerBytes) + "." + b64urlNoPad(payload) + "." + b64urlNoPad([]byte("not-a-real-signature"))
+}
+
+// rawCompactJWTWithAlg hand-constructs a compact-serialized JWT whose header
+// carries an arbitrary alg value. See rawCompactJWTWithHeader.
+func rawCompactJWTWithAlg(t *testing.T, alg string, claims map[string]interface{}) string {
+	t.Helper()
+	return rawCompactJWTWithHeader(t, map[string]interface{}{"alg": alg, "typ": "JWT"}, claims)
 }
 
 // TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg proves that when a
@@ -640,6 +646,45 @@ func TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
 	require.False(t, errors.Is(err, ErrTransient), "an unsupported alg is a parse-time rejection, not a transient JWKS/kid failure")
 	require.NotContains(t, err.Error(), algMarker, "ValidateStrictJWT must not leak the attacker-controlled alg header value in its own returned error")
+}
+
+// TestValidateStrictJWT_MalformedKidTypeDoesNotLeakKid proves the structural
+// fix (jwtHeaderParseError in oauth/jwt.go) covers the whole class of
+// pre-signature header-parse errors, not just the unexpected-alg shape
+// above. When the JWT header's `kid` field is present but has the wrong JSON
+// type (a JSON object here, instead of a string), go-jose's
+// rawHeader.sanitized() fails to unmarshal it and interpolates the raw,
+// unverified kid JSON verbatim into its error text via %#v (case
+// headerKeyID in go-jose's shared.go). That error surfaces through
+// parseAndFetchKeys' "failed to parse signed JWT: %w" wrap before any JWKS
+// fetch happens, so it must be caught by the same errors.As-based
+// jwtHeaderParseError classification ValidateStrictJWT uses for the
+// unexpected-alg case — not by a fourth bespoke, shape-specific check.
+// Sabotage case: narrow ValidateStrictJWT's check back down to only
+// *jose.ErrUnexpectedSignatureAlgorithm (i.e. revert to enumerating error
+// shapes one at a time) and this test fails.
+func TestValidateStrictJWT_MalformedKidTypeDoesNotLeakKid(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	now := time.Now()
+
+	// An email-like marker nested inside an object-typed kid header,
+	// guaranteed not to appear anywhere else in the error text.
+	const kidMarker = "attacker@leaked-kid-type.example.com"
+	header := map[string]interface{}{
+		"alg": "RS256",
+		"typ": "JWT",
+		"kid": map[string]interface{}{"leaked-marker": kidMarker},
+	}
+	token := rawCompactJWTWithHeader(t, header, baseClaims("https://issuer.example.com", "api-1", now))
+
+	_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
+	require.False(t, errors.Is(err, ErrTransient), "a malformed kid type is a parse-time rejection, not a transient JWKS/kid-rotation failure")
+	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
 }
 
 // TestValidateStrictJWT_ExistingCallersUnaffected is a targeted regression

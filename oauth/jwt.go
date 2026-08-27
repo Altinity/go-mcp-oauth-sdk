@@ -46,6 +46,22 @@ var signatureAlgorithms = []jose.SignatureAlgorithm{
 	jose.EdDSA,
 }
 
+// jwtHeaderParseError classifies an error returned by parseAndFetchKeys'
+// initial jwt.ParseSigned call (or its header-length check) as having
+// originated before any signature verification — meaning its Error() text
+// may embed raw, unverified, attacker-controlled JWT header content
+// (malformed kid/alg/nonce/x5c type, unexpected alg, etc. — go-jose's
+// rawHeader.sanitized() interpolates the raw header value into several
+// distinct error shapes, and enumerating each one individually is how a
+// one-pass review becomes four). ValidateStrictJWT must sanitize this
+// whole class before returning; parseAndVerifyExternalJWT's existing
+// callers are unaffected because Error() delegates to the wrapped error
+// unchanged.
+type jwtHeaderParseError struct{ err error }
+
+func (e *jwtHeaderParseError) Error() string { return e.err.Error() }
+func (e *jwtHeaderParseError) Unwrap() error { return e.err }
+
 // parseAndFetchKeys parses a compact-serialised JWT and resolves the JWKS
 // candidate keys for verifying it: the entries matching the token's `kid`
 // header (with a one-shot cache-bypass re-fetch on a kid miss, to tolerate
@@ -62,10 +78,10 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 
 	parsed, err := jwt.ParseSigned(token, signatureAlgorithms)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse signed JWT: %w", err)
+		return nil, nil, &jwtHeaderParseError{err: fmt.Errorf("failed to parse signed JWT: %w", err)}
 	}
 	if len(parsed.Headers) == 0 {
-		return nil, nil, fmt.Errorf("missing JWT header")
+		return nil, nil, &jwtHeaderParseError{err: fmt.Errorf("missing JWT header")}
 	}
 
 	keySet, err := v.fetchJWKSet(ctx, jwksURI)

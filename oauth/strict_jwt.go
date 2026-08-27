@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/go-jose/go-jose/v4"
 )
 
 // int64MinAsFloat and int64MaxAsFloat are the safe float64 bounds for
@@ -222,20 +220,6 @@ func isKidNotFoundError(err error) bool {
 	return errors.Is(err, ErrTransient) && strings.HasPrefix(err.Error(), kidNotFoundErrorPrefix)
 }
 
-// isUnexpectedSignatureAlgorithmError reports whether err wraps go-jose's
-// *jose.ErrUnexpectedSignatureAlgorithm — the error jwt.ParseSigned returns
-// (via parseAndFetchKeys in oauth/jwt.go, wrapped as "failed to parse signed
-// JWT: %w") when a token's header `alg` isn't in signatureAlgorithms. That
-// error's Error() method interpolates its Got field verbatim, which go-jose
-// populates directly from the token header — i.e. attacker-controlled,
-// unverified, pre-signature-check content — so, like the kid-not-found case
-// above, ValidateStrictJWT must not let it reach its own returned error
-// unsanitized.
-func isUnexpectedSignatureAlgorithmError(err error) bool {
-	var algErr *jose.ErrUnexpectedSignatureAlgorithm
-	return errors.As(err, &algErr)
-}
-
 // ValidateStrictJWT validates token against policy with byte-exact issuer/
 // audience matching and mandatory exp, in contrast to ValidateToken's
 // soft-pass-on-opaque-bearer and trailing-slash-tolerant behavior. It never
@@ -247,17 +231,20 @@ func isUnexpectedSignatureAlgorithmError(err error) bool {
 // this function adds no separate key-fetching path. Any error from that
 // machinery — including the ErrTransient-wrapped network/discovery/
 // kid-rotation failures — is returned unchanged, with two exceptions, both
-// of which embed attacker-controlled (unverified, pre-signature) JWT header
-// content in their Error() text and are sanitized to a fixed message before
-// reaching this function's caller:
+// of which may embed attacker-controlled (unverified, pre-signature) JWT
+// header content in their Error() text and are sanitized to a fixed message
+// before reaching this function's caller:
 //
 //   - The "no JWK found for kid %q" case embeds the token's `kid` header
 //     value. Stripped below — see the isKidNotFoundError check — while
 //     errors.Is(err, ErrTransient) still holds.
-//   - go-jose's *jose.ErrUnexpectedSignatureAlgorithm (from jwt.ParseSigned,
-//     when the token's `alg` header isn't in signatureAlgorithms) embeds the
-//     token's `alg` header value. Stripped below — see the
-//     isUnexpectedSignatureAlgorithmError check — and reclassified as
+//   - Any error from parseAndFetchKeys' initial jwt.ParseSigned call or its
+//     header-length check — before any JWKS fetch or kid lookup — is wrapped
+//     in a *jwtHeaderParseError (oauth/jwt.go). go-jose's header-sanitization
+//     logic interpolates raw, unverified header content into several
+//     distinct error shapes here (unexpected `alg`, malformed `kid`/`nonce`/
+//     `x5c` type, etc.), so this is handled as one class via errors.As rather
+//     than enumerated case by case. Stripped below and reclassified as
 //     ErrInvalidToken, since a parse failure is not one of parseAndFetchKeys'
 //     JWKS-fetch/kid-rotation transient failures.
 //
@@ -272,18 +259,22 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 
 	parsed, keys, err := v.parseAndFetchKeys(ctx, token)
 	if err != nil {
-		if isUnexpectedSignatureAlgorithmError(err) {
-			// jwt.ParseSigned's *jose.ErrUnexpectedSignatureAlgorithm embeds
-			// the raw, unverified `alg` header value from the token in its
-			// Error() text (see isUnexpectedSignatureAlgorithmError). Unlike
-			// parseAndVerifyExternalJWT's callers (left unchanged — this
-			// check only affects what ValidateStrictJWT itself returns),
-			// ValidateStrictJWT must never let that attacker-controlled
-			// header data reach its own returned-error surface. This is a
-			// parse-time rejection, not one of parseAndFetchKeys' JWKS-fetch/
-			// kid-rotation ErrTransient failures, so it's classified as
-			// ErrInvalidToken rather than ErrTransient.
-			return nil, fmt.Errorf("%w: unsupported or unexpected JWT signature algorithm", ErrInvalidToken)
+		var headerParseErr *jwtHeaderParseError
+		if errors.As(err, &headerParseErr) {
+			// err originated in parseAndFetchKeys' initial jwt.ParseSigned
+			// call or its header-length check — i.e. before any JWKS fetch
+			// or kid lookup — so its Error() text may embed raw, unverified,
+			// attacker-controlled JWT header content (unexpected `alg`,
+			// malformed `kid` type, etc. — see jwtHeaderParseError in
+			// oauth/jwt.go). Unlike parseAndVerifyExternalJWT's callers (left
+			// unchanged — this check only affects what ValidateStrictJWT
+			// itself returns), ValidateStrictJWT must never let that
+			// attacker-controlled header data reach its own returned-error
+			// surface. This is a parse-time rejection, not one of
+			// parseAndFetchKeys' JWKS-fetch/kid-rotation ErrTransient
+			// failures, so it's classified as ErrInvalidToken rather than
+			// ErrTransient.
+			return nil, fmt.Errorf("%w: unable to parse or validate JWT header", ErrInvalidToken)
 		}
 		if isKidNotFoundError(err) {
 			// parseAndFetchKeys' "no JWK found for kid %q" error (oauth/jwt.go)
