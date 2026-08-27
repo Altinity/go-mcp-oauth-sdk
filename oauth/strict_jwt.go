@@ -3,9 +3,22 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+)
+
+// int64MinAsFloat and int64MaxAsFloat are the safe float64 bounds for
+// conversion to int64. 9223372036854775808.0 is 2^63, the correct strict
+// upper bound: note that float64(math.MaxInt64) itself rounds UP to 2^63 due
+// to float64's limited mantissa precision, so comparing against
+// float64(math.MaxInt64) directly would wrongly admit the overflow boundary
+// value. -9223372036854775808.0 is exactly representable (it's -2^63) and is
+// math.MinInt64, so it remains the correct (inclusive) lower bound.
+const (
+	int64MinAsFloat = -9223372036854775808.0 // -2^63, exactly math.MinInt64
+	int64MaxAsFloat = 9223372036854775808.0  // 2^63, exclusive upper bound
 )
 
 // StrictJWTPolicy configures ValidateStrictJWT's byte-exact issuer/audience
@@ -104,6 +117,16 @@ func strictNumericClaim(rawClaims map[string]interface{}, key string) (value int
 	}
 	switch n := raw.(type) {
 	case float64:
+		// Converting an out-of-range float64 to int64 via a bare int64(n) is
+		// implementation-defined in Go (it can saturate to math.MaxInt64 on
+		// some architectures, or wrap to math.MinInt64 on others). A
+		// well-typed but absurdly large exp/nbf/iat (e.g. 1e30) could
+		// therefore silently invert the intended comparison depending on the
+		// build architecture. Reject anything outside the safe int64 range
+		// as malformed instead of converting it.
+		if n < int64MinAsFloat || n >= int64MaxAsFloat {
+			return 0, true, true
+		}
 		return int64(n), true, false
 	case json.Number:
 		i, err := n.Int64()
@@ -169,6 +192,22 @@ func validateStrictRawClaims(rawClaims map[string]interface{}, policy StrictJWTP
 	return nil
 }
 
+// kidNotFoundErrorPrefix is the fixed, non-attacker-controlled prefix of the
+// error parseAndFetchKeys (oauth/jwt.go) returns when a JWKS re-fetch still
+// can't find the token's kid. Matching on this fixed prefix (rather than on
+// the error's dynamic %q-quoted kid suffix, which is exactly the part that
+// must never reach ValidateStrictJWT's caller) lets isKidNotFoundError detect
+// this specific case without hardcoding, or otherwise reproducing, any
+// attacker-controlled content.
+const kidNotFoundErrorPrefix = "no JWK found for kid "
+
+// isKidNotFoundError reports whether err is parseAndFetchKeys' "no JWK found
+// for kid %q" error — the one ErrTransient failure out of parseAndFetchKeys
+// that embeds the attacker-controlled `kid` JWT header value in its text.
+func isKidNotFoundError(err error) bool {
+	return errors.Is(err, ErrTransient) && strings.HasPrefix(err.Error(), kidNotFoundErrorPrefix)
+}
+
 // ValidateStrictJWT validates token against policy with byte-exact issuer/
 // audience matching and mandatory exp, in contrast to ValidateToken's
 // soft-pass-on-opaque-bearer and trailing-slash-tolerant behavior. It never
@@ -179,7 +218,11 @@ func validateStrictRawClaims(rawClaims map[string]interface{}, policy StrictJWTP
 // parseAndVerifyExternalJWT relies on (parseAndFetchKeys in oauth/jwt.go);
 // this function adds no separate key-fetching path. Any error from that
 // machinery — including the ErrTransient-wrapped network/discovery/
-// kid-rotation failures — is returned unchanged.
+// kid-rotation failures — is returned unchanged, with one exception: the
+// "no JWK found for kid %q" case embeds the attacker-controlled (unverified,
+// pre-signature) `kid` header value from the token. That value is stripped
+// before it reaches this function's caller — see the isKidNotFoundError
+// check below — while errors.Is(err, ErrTransient) still holds.
 //
 // The token string is never included in any returned error or log line.
 func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy StrictJWTPolicy) (*Claims, error) {
@@ -192,6 +235,19 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 
 	parsed, keys, err := v.parseAndFetchKeys(ctx, token)
 	if err != nil {
+		if isKidNotFoundError(err) {
+			// parseAndFetchKeys' "no JWK found for kid %q" error (oauth/jwt.go)
+			// embeds the raw, unverified `kid` JWT header value in its text.
+			// That's fine for parseAndVerifyExternalJWT's existing callers
+			// (left unchanged — this check only affects what ValidateStrictJWT
+			// itself returns), but ValidateStrictJWT must never let
+			// attacker-controlled header data reach its own returned-error
+			// surface. Sanitize just this case to a fixed message, preserving
+			// errors.Is(err, ErrTransient); other ErrTransient failures from
+			// this step (network/discovery/JWKS-endpoint errors) don't embed
+			// attacker data and are returned unchanged.
+			return nil, fmt.Errorf("failed to resolve a JWK for the token's key id: %w", ErrTransient)
+		}
 		return nil, err
 	}
 

@@ -225,6 +225,22 @@ func TestValidateStrictJWT_AudienceRejections(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
+
+	// Sabotage case: reintroduce audienceMatchesResource-style trailing-slash
+	// normalization into strictAudienceIntersects and this test must go red —
+	// unlike parseAndVerifyExternalJWT's issuer/audience matching, the strict
+	// path is byte-exact and must reject a trailing-slash-only difference.
+	t.Run("trailing-slash-only audience difference fails (byte-exact, unlike audienceMatchesResource)", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com", "https://api.example.com/", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"https://api.example.com"},
+		})
+		require.Error(t, err, "byte-exact audience comparison must reject a trailing-slash-only difference")
+	})
 }
 
 func TestValidateStrictJWT_SignatureAndIssuer(t *testing.T) {
@@ -305,6 +321,28 @@ func TestValidateStrictJWT_Expiry(t *testing.T) {
 			ExpectedAudiences: []string{"api-1"},
 		})
 		require.Error(t, err)
+	})
+
+	// Sabotage case: convert the raw float64 exp via a bare int64(n) instead
+	// of range-checking first. A bare conversion is implementation-defined
+	// for an out-of-range float64 (it can saturate to math.MaxInt64 on some
+	// architectures, or wrap around to a negative number on others) — either
+	// way an absurdly large exp like 1e30 must never be silently accepted or
+	// misinterpreted as already-expired/not-expired by accident. It must be
+	// rejected outright as malformed.
+	t.Run("absurdly large exp fails as malformed, not silently converted", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = 1e30
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+		require.False(t, errors.Is(err, ErrTokenExpired), "an out-of-range exp must be rejected as malformed, not classified as expired")
 	})
 
 	t.Run("expired beyond leeway fails", func(t *testing.T) {
@@ -415,6 +453,33 @@ func TestValidateStrictJWT_RequiredScopes(t *testing.T) {
 	require.ErrorIs(t, err, ErrInsufficientScopes)
 }
 
+// TestValidateStrictJWT_KidNotFoundDoesNotLeakKid proves that when
+// parseAndFetchKeys' "no JWK found for kid %q" error (oauth/jwt.go) bubbles
+// up through ValidateStrictJWT, the attacker-controlled (unverified,
+// pre-signature) `kid` header value it embeds never reaches
+// ValidateStrictJWT's own returned error — even though errors.Is(err,
+// ErrTransient) must still hold, since that's how callers like the
+// ch-jwt-verify sidecar distinguish "transient, don't negative-cache" from a
+// hard rejection. Sabotage case: forward parseAndFetchKeys' error unchanged
+// from ValidateStrictJWT and this test fails.
+func TestValidateStrictJWT_KidNotFoundDoesNotLeakKid(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	now := time.Now()
+
+	// An email-like marker embedded in the kid header, guaranteed not to
+	// appear anywhere else in the token, claims, or JWKS response.
+	const kidMarker = "attacker-marker-user@leaked-kid.example.com"
+	token := signRawClaimsWithKey(t, idp.key, kidMarker, baseClaims("https://issuer.example.com", "api-1", now))
+
+	_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
+	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
+}
+
 // TestValidateStrictJWT_JWKSFailureWrapsTransient proves point 13: a
 // JWKS-fetch failure (upstream 5xx here) surfaces as ErrTransient, reusing
 // fetchJWKSet's existing error path rather than a bespoke one.
@@ -493,6 +558,13 @@ func TestValidateStrictJWT_NoTokenLeakage(t *testing.T) {
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), marker)
 		require.NotContains(t, err.Error(), token)
+		// The marker claim is base64url-encoded as part of the compact JWT,
+		// so it never appears as a literal substring of token — checking
+		// only for the marker in the log buffer would miss a sabotage that
+		// logs the raw compact token string directly. Check per-iteration,
+		// while we still know which token produced this scenario's log
+		// output, that the log buffer never contains it either.
+		require.NotContains(t, logBuf.String(), token, "scenario %q must not log the raw compact JWT", sc.name)
 	}
 
 	logged := logBuf.String()
