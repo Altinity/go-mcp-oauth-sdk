@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -54,9 +55,10 @@ var signatureAlgorithms = []jose.SignatureAlgorithm{
 // rawHeader.sanitized() interpolates the raw header value into several
 // distinct error shapes, and enumerating each one individually is how a
 // one-pass review becomes four). ValidateStrictJWT must sanitize this
-// whole class before returning; parseAndVerifyExternalJWT's existing
-// callers are unaffected because Error() delegates to the wrapped error
-// unchanged.
+// whole class before returning; parseAndVerifyExternalJWT unwraps this
+// wrapper immediately (see its own errors.As check) before returning to
+// its existing callers, so their Error() text and their exact one-step
+// errors.Unwrap() depth are both unaffected by this wrapper's existence.
 type jwtHeaderParseError struct{ err error }
 
 func (e *jwtHeaderParseError) Error() string { return e.err.Error() }
@@ -128,6 +130,17 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 func (v *Verifier) parseAndVerifyExternalJWT(ctx context.Context, token, expectedAudience string) (*Claims, error) {
 	parsed, keys, err := v.parseAndFetchKeys(ctx, token)
 	if err != nil {
+		var headerParseErr *jwtHeaderParseError
+		if errors.As(err, &headerParseErr) {
+			// Unwrap the jwtHeaderParseError classification wrapper before
+			// returning: ValidateStrictJWT needs it (via errors.As) to detect
+			// this pre-signature-verification error class, but this
+			// function's existing callers predate that wrapper and must see
+			// the exact same object graph as before it was introduced — a
+			// single errors.Unwrap() on the returned error should land
+			// directly on the wrapped fmt.Errorf, not on the wrapper itself.
+			return nil, headerParseErr.err
+		}
 		return nil, err
 	}
 

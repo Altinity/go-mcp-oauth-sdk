@@ -625,14 +625,22 @@ func rawCompactJWTWithAlg(t *testing.T, alg string, claims map[string]interface{
 // token's header `alg` isn't in signatureAlgorithms, go-jose's
 // *jose.ErrUnexpectedSignatureAlgorithm — which embeds that raw,
 // attacker-controlled (unverified, pre-signature) alg value in its Error()
-// text — never reaches ValidateStrictJWT's own returned error. Sabotage
-// case: forward parseAndFetchKeys' wrapped parse error unchanged from
-// ValidateStrictJWT (i.e. delete the isUnexpectedSignatureAlgorithmError
-// check) and this test fails.
+// text — never reaches ValidateStrictJWT's own returned error, nor anything
+// logged via the package's zerolog logger (same buffer-swap pattern as
+// TestValidateStrictJWT_NoTokenLeakage — not run in parallel with other
+// tests for the same reason: it swaps the shared global zerolog logger).
+// Sabotage case: forward parseAndFetchKeys' wrapped parse error unchanged
+// from ValidateStrictJWT (i.e. delete the isUnexpectedSignatureAlgorithmError
+// check) and this test fails; sabotage case for the log assertions: log the
+// raw token or the header value on this path and they fail too.
 func TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg(t *testing.T) {
-	t.Parallel()
 	idp := newStrictTestIdP(t)
 	now := time.Now()
+
+	var logBuf bytes.Buffer
+	origLogger := zlog.Logger
+	zlog.Logger = zerolog.New(&logBuf)
+	defer func() { zlog.Logger = origLogger }()
 
 	// An email-like marker used as the alg value itself, guaranteed not to
 	// appear anywhere else in the error text.
@@ -646,6 +654,10 @@ func TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
 	require.False(t, errors.Is(err, ErrTransient), "an unsupported alg is a parse-time rejection, not a transient JWKS/kid failure")
 	require.NotContains(t, err.Error(), algMarker, "ValidateStrictJWT must not leak the attacker-controlled alg header value in its own returned error")
+
+	logged := logBuf.String()
+	require.NotContains(t, logged, algMarker, "ValidateStrictJWT must not log the attacker-controlled alg header value")
+	require.NotContains(t, logged, token, "ValidateStrictJWT must not log the raw compact JWT")
 }
 
 // TestValidateStrictJWT_MalformedKidTypeDoesNotLeakKid proves the structural
@@ -662,11 +674,19 @@ func TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg(t *testing.T) {
 // unexpected-alg case — not by a fourth bespoke, shape-specific check.
 // Sabotage case: narrow ValidateStrictJWT's check back down to only
 // *jose.ErrUnexpectedSignatureAlgorithm (i.e. revert to enumerating error
-// shapes one at a time) and this test fails.
+// shapes one at a time) and this test fails. Also captures logged output
+// (same buffer-swap pattern as TestValidateStrictJWT_NoTokenLeakage — not
+// run in parallel with other tests for the same reason: it swaps the shared
+// global zerolog logger) and asserts neither the marker nor the raw token
+// is logged.
 func TestValidateStrictJWT_MalformedKidTypeDoesNotLeakKid(t *testing.T) {
-	t.Parallel()
 	idp := newStrictTestIdP(t)
 	now := time.Now()
+
+	var logBuf bytes.Buffer
+	origLogger := zlog.Logger
+	zlog.Logger = zerolog.New(&logBuf)
+	defer func() { zlog.Logger = origLogger }()
 
 	// An email-like marker nested inside an object-typed kid header,
 	// guaranteed not to appear anywhere else in the error text.
@@ -685,6 +705,10 @@ func TestValidateStrictJWT_MalformedKidTypeDoesNotLeakKid(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
 	require.False(t, errors.Is(err, ErrTransient), "a malformed kid type is a parse-time rejection, not a transient JWKS/kid-rotation failure")
 	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
+
+	logged := logBuf.String()
+	require.NotContains(t, logged, kidMarker, "ValidateStrictJWT must not log the attacker-controlled kid header value")
+	require.NotContains(t, logged, token, "ValidateStrictJWT must not log the raw compact JWT")
 }
 
 // TestValidateStrictJWT_ExistingCallersUnaffected is a targeted regression
