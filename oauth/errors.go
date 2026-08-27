@@ -19,6 +19,13 @@ var (
 	// token's principal domain is not in the configured allowed-email-domain
 	// / allowed-hosted-domain list.
 	ErrUnauthorizedDomain = errors.New("OAuth identity domain is not allowed")
+	// ErrEmailClaimMissing is returned by ValidateIdentityClaims when an
+	// AllowedEmailDomains policy is configured but the token carries no
+	// email claim at all. Kept distinct from ErrUnauthorizedDomain so a
+	// caller (or its logs) can tell "no email to check" apart from "email
+	// present but wrong domain" without either error ever containing the
+	// email value itself.
+	ErrEmailClaimMissing = errors.New("oauth token has no email claim")
 	// ErrTransient marks a validation failure that callers should NOT treat
 	// as a permanent rejection: network errors fetching JWKS / OIDC
 	// discovery, upstream 5xx, and the "no JWK found for kid" race where

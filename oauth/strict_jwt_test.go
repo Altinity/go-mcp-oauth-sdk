@@ -1,0 +1,530 @@
+package oauth
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
+	"github.com/stretchr/testify/require"
+)
+
+// strictTestIdP is a minimal httptest-backed JWKS server plus a signer for
+// ValidateStrictJWT test tokens. Independent of any shared fixture, per this
+// repo's convention (see verifier_test.go's TestParseAndVerifyExternalJWTUnknownKid).
+type strictTestIdP struct {
+	t        *testing.T
+	server   *httptest.Server
+	verifier *Verifier
+	key      *rsa.PrivateKey
+	kid      string
+}
+
+const strictTestKid = "strict-test-kid"
+
+func newStrictTestIdP(t *testing.T) *strictTestIdP {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+			{Key: &key.PublicKey, KeyID: strictTestKid, Algorithm: "RS256", Use: "sig"},
+		}})
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v := NewVerifier(OAuthConfig{JWKSURL: server.URL + "/jwks"})
+	return &strictTestIdP{t: t, server: server, verifier: v, key: key, kid: strictTestKid}
+}
+
+// sign marshals claims and signs them with idp's key under the given kid
+// header — a distinct kid parameter (rather than always idp.kid) lets the
+// "invalid signature" test put a kid on the token that matches an entry in
+// the JWKS while actually signing with a different, unregistered key.
+func signRawClaimsWithKey(t *testing.T, key *rsa.PrivateKey, kid string, claims map[string]interface{}) string {
+	t.Helper()
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
+	)
+	require.NoError(t, err)
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	obj, err := signer.Sign(payload)
+	require.NoError(t, err)
+	token, err := obj.CompactSerialize()
+	require.NoError(t, err)
+	return token
+}
+
+func (idp *strictTestIdP) sign(claims map[string]interface{}) string {
+	return signRawClaimsWithKey(idp.t, idp.key, idp.kid, claims)
+}
+
+// baseClaims returns a well-formed claim set (iss/aud/exp/iat/sub) that
+// individual tests mutate to exercise one specific rejection.
+func baseClaims(issuer string, aud interface{}, now time.Time) map[string]interface{} {
+	return map[string]interface{}{
+		"sub": "user-1",
+		"iss": issuer,
+		"aud": aud,
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	}
+}
+
+func TestValidateStrictJWT_Success(t *testing.T) {
+	t.Parallel()
+
+	t.Run("string aud", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com", "api-1", now))
+
+		claims, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedIssuer:    "https://issuer.example.com",
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, "user-1", claims.Subject)
+	})
+
+	t.Run("array aud intersects", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com", []interface{}{"api-1", "api-2"}, now))
+
+		claims, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedIssuer:    "https://issuer.example.com",
+			ExpectedAudiences: []string{"api-2", "api-3"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, "user-1", claims.Subject)
+	})
+
+	t.Run("required scopes satisfied", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["scope"] = "read write"
+		token := idp.sign(claims)
+
+		got, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedIssuer:    "https://issuer.example.com",
+			ExpectedAudiences: []string{"api-1"},
+			RequiredScopes:    []string{"read"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{"read", "write"}, got.Scopes)
+	})
+
+	t.Run("expired past leeway-adjusted deadline still within leeway succeeds", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = now.Add(-30 * time.Second).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.NoError(t, err)
+	})
+}
+
+// TestValidateStrictJWT_NeverSoftPasses proves the strict path never
+// returns (nil, nil) for an opaque bearer — the sabotage case: remove the
+// looksLikeJWT check and this starts returning nil error.
+func TestValidateStrictJWT_NeverSoftPasses(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	claims, err := idp.verifier.ValidateStrictJWT(context.Background(), "not-a-jwt-opaque-bearer", StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+	require.Nil(t, claims)
+}
+
+func TestValidateStrictJWT_AudienceRejections(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no intersection fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com", "api-1", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-2"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("empty ExpectedAudiences fails without even fetching JWKS", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com", "api-1", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: nil,
+		})
+		require.Error(t, err)
+
+		_, err = idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"", "   "},
+		})
+		require.Error(t, err)
+	})
+
+	// Sabotage case: reuse claimsFromRawClaims's lossy aud projection instead
+	// of the raw type-switch — the bad element would silently drop and
+	// "good-aud" would wrongly match. This test regresses under that
+	// sabotage.
+	t.Run("mixed-type aud array fails, does not partially match", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", []interface{}{"good-aud", 12345}, now)
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"good-aud"},
+		})
+		require.Error(t, err, "malformed aud must not partially match on the well-formed element")
+	})
+
+	t.Run("missing aud claim fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		delete(claims, "aud")
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+}
+
+func TestValidateStrictJWT_SignatureAndIssuer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("invalid signature fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		now := time.Now()
+		// Signed with a key that is NOT the one published under this kid in
+		// the JWKS — parsed.Claims must fail signature verification.
+		token := signRawClaimsWithKey(t, wrongKey, idp.kid, baseClaims("https://issuer.example.com", "api-1", now))
+
+		_, err = idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("wrong issuer fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://other-issuer.example.com", "api-1", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedIssuer:    "https://issuer.example.com",
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+
+	// Sabotage case: reuse the trailing-slash-normalized issuer comparison
+	// from parseAndVerifyExternalJWT instead of a byte-exact one — this
+	// test would then wrongly pass.
+	t.Run("trailing-slash-only issuer difference fails (byte-exact, unlike parseAndVerifyExternalJWT)", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		token := idp.sign(baseClaims("https://issuer.example.com/", "api-1", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedIssuer:    "https://issuer.example.com",
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err, "byte-exact issuer comparison must reject a trailing-slash-only difference")
+	})
+}
+
+func TestValidateStrictJWT_Expiry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing exp fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		delete(claims, "exp")
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("non-numeric exp fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = "not-a-number"
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("expired beyond leeway fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = now.Add(-2 * time.Minute).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.ErrorIs(t, err, ErrTokenExpired)
+	})
+}
+
+func TestValidateStrictJWT_NotBeforeAndIssuedAt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nbf in future beyond leeway fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["nbf"] = now.Add(2 * time.Minute).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("nbf within leeway succeeds", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["nbf"] = now.Add(30 * time.Second).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("malformed nbf fails (not treated as absent)", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["nbf"] = "garbage"
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("iat in future beyond leeway fails", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["iat"] = now.Add(2 * time.Minute).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("malformed iat fails (not treated as absent)", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["iat"] = "garbage"
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+		})
+		require.Error(t, err)
+	})
+}
+
+func TestValidateStrictJWT_RequiredScopes(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	now := time.Now()
+	claims := baseClaims("https://issuer.example.com", "api-1", now)
+	claims["scope"] = "read"
+	token := idp.sign(claims)
+
+	_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+		RequiredScopes:    []string{"admin"},
+	})
+	require.ErrorIs(t, err, ErrInsufficientScopes)
+}
+
+// TestValidateStrictJWT_JWKSFailureWrapsTransient proves point 13: a
+// JWKS-fetch failure (upstream 5xx here) surfaces as ErrTransient, reusing
+// fetchJWKSet's existing error path rather than a bespoke one.
+func TestValidateStrictJWT_JWKSFailureWrapsTransient(t *testing.T) {
+	t.Parallel()
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mockServer.Close()
+
+	v := NewVerifier(OAuthConfig{JWKSURL: mockServer.URL + "/jwks"})
+
+	// A well-formed (but arbitrarily signed) token — the failure must come
+	// from the JWKS fetch, not from token parsing.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	now := time.Now()
+	token := signRawClaimsWithKey(t, key, "any-kid", baseClaims("https://issuer.example.com", "api-1", now))
+
+	_, err = v.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
+}
+
+// TestValidateStrictJWT_NoTokenLeakage is the marker-based test from the
+// invariant map: inject a unique marker into the raw token and assert it
+// never surfaces in a returned error string, nor in anything logged via the
+// package's zerolog logger, across several distinct failure paths. Sabotage
+// case: log/format the token on any of these paths and this test fails.
+func TestValidateStrictJWT_NoTokenLeakage(t *testing.T) {
+	idp := newStrictTestIdP(t)
+	now := time.Now()
+
+	var logBuf bytes.Buffer
+	origLogger := zlog.Logger
+	zlog.Logger = zerolog.New(&logBuf)
+	defer func() { zlog.Logger = origLogger }()
+
+	scenarios := []struct {
+		name   string
+		claims map[string]interface{}
+		policy StrictJWTPolicy
+	}{
+		{
+			name:   "wrong issuer",
+			claims: baseClaims("https://wrong-issuer.example.com", "api-1", now),
+			policy: StrictJWTPolicy{ExpectedIssuer: "https://issuer.example.com", ExpectedAudiences: []string{"api-1"}},
+		},
+		{
+			name: "expired",
+			claims: func() map[string]interface{} {
+				c := baseClaims("https://issuer.example.com", "api-1", now)
+				c["exp"] = now.Add(-time.Hour).Unix()
+				return c
+			}(),
+			policy: StrictJWTPolicy{ExpectedAudiences: []string{"api-1"}},
+		},
+		{
+			name:   "no audience intersection",
+			claims: baseClaims("https://issuer.example.com", "api-1", now),
+			policy: StrictJWTPolicy{ExpectedAudiences: []string{"other-api"}},
+		},
+	}
+
+	for _, sc := range scenarios {
+		// Embed a per-token marker in a claim so a bug that formats "the
+		// claims" or "the payload" into an error would also be caught, not
+		// just a bug that formats the raw compact-serialized token.
+		marker := "TOKEN-MARKER-" + sc.name
+		sc.claims["jti"] = marker
+		token := idp.sign(sc.claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, sc.policy)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), marker)
+		require.NotContains(t, err.Error(), token)
+	}
+
+	logged := logBuf.String()
+	require.NotContains(t, logged, "TOKEN-MARKER-")
+}
+
+// TestValidateStrictJWT_ExistingCallersUnaffected is a targeted regression
+// check that parseAndVerifyExternalJWT's trailing-slash-tolerant issuer/
+// audience matching survived the parseAndFetchKeys extraction unchanged —
+// the full pre-existing suite (verifier_test.go) covers this more broadly,
+// but this pins the specific slash-tolerance behavior the strict path is
+// deliberately NOT allowed to share.
+func TestValidateStrictJWT_ExistingCallersUnaffected(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	idp.verifier = NewVerifier(OAuthConfig{
+		JWKSURL: idp.server.URL + "/jwks",
+		Issuer:  "https://issuer.example.com", // no trailing slash
+	})
+	now := time.Now()
+	// Token issuer HAS a trailing slash — parseAndVerifyExternalJWT
+	// normalizes both sides and must still accept this.
+	token := idp.sign(baseClaims("https://issuer.example.com/", "api-1", now))
+
+	claims, err := idp.verifier.parseAndVerifyExternalJWT(context.Background(), token, "api-1")
+	require.NoError(t, err)
+	require.Equal(t, "user-1", claims.Subject)
+
+	// Same slash-only difference, through the strict path, must fail.
+	_, err = idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedIssuer:    "https://issuer.example.com",
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+}

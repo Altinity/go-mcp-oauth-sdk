@@ -35,34 +35,42 @@ func audienceMatchesResource(claims []string, expected string) bool {
 	return false
 }
 
-// parseAndVerifyExternalJWT parses a compact-serialised JWT, fetches the JWKS
-// for the configured issuer (with a one-shot kid-rotation refresh), and
-// returns the validated claims. Issuer enforcement (singular config.Issuer)
-// and audience enforcement (expectedAudience) both happen here, slash-
-// normalised so a deployment whose issuer config omits the trailing slash
-// matches a token whose `iss` includes it.
-func (v *Verifier) parseAndVerifyExternalJWT(ctx context.Context, token, expectedAudience string) (*Claims, error) {
+// signatureAlgorithms lists the JWS algorithms accepted when parsing a
+// compact-serialised JWT. Shared by parseAndVerifyExternalJWT and
+// ValidateStrictJWT (oauth/strict_jwt.go) so both paths accept exactly the
+// same signature algorithm set.
+var signatureAlgorithms = []jose.SignatureAlgorithm{
+	jose.RS256, jose.RS384, jose.RS512,
+	jose.ES256, jose.ES384, jose.ES512,
+	jose.PS256, jose.PS384, jose.PS512,
+	jose.EdDSA,
+}
+
+// parseAndFetchKeys parses a compact-serialised JWT and resolves the JWKS
+// candidate keys for verifying it: the entries matching the token's `kid`
+// header (with a one-shot cache-bypass re-fetch on a kid miss, to tolerate
+// IdP key rotation — see the inline comments below), or the full key set
+// when the token carries no kid. This is the JWKS discovery/cache/
+// kid-rotation machinery shared by parseAndVerifyExternalJWT and
+// ValidateStrictJWT; neither the caller-facing issuer/audience/claim
+// semantics nor any other behavior lives here.
+func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JSONWebToken, []jose.JSONWebKey, error) {
 	jwksURI, err := v.resolveJWKSURL(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	parsed, err := jwt.ParseSigned(token, []jose.SignatureAlgorithm{
-		jose.RS256, jose.RS384, jose.RS512,
-		jose.ES256, jose.ES384, jose.ES512,
-		jose.PS256, jose.PS384, jose.PS512,
-		jose.EdDSA,
-	})
+	parsed, err := jwt.ParseSigned(token, signatureAlgorithms)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse signed JWT: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse signed JWT: %w", err)
 	}
 	if len(parsed.Headers) == 0 {
-		return nil, fmt.Errorf("missing JWT header")
+		return nil, nil, fmt.Errorf("missing JWT header")
 	}
 
 	keySet, err := v.fetchJWKSet(ctx, jwksURI)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	keys := keySet.Keys
@@ -76,7 +84,7 @@ func (v *Verifier) parseAndVerifyExternalJWT(ctx context.Context, token, expecte
 			v.invalidateJWKSCache()
 			keySet, err = v.fetchJWKSet(ctx, jwksURI)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			keys = keySet.Key(keyID)
 			if len(keys) == 0 {
@@ -86,10 +94,25 @@ func (v *Verifier) parseAndVerifyExternalJWT(ctx context.Context, token, expecte
 				// sidecar treats this as transient so a multi-replica
 				// rotation race doesn't pin a real token as bad on one
 				// replica via the negative cache.
-				return nil, fmt.Errorf("no JWK found for kid %q: %w", keyID, ErrTransient)
+				return nil, nil, fmt.Errorf("no JWK found for kid %q: %w", keyID, ErrTransient)
 			}
 			log.Info().Str("kid", keyID).Msg("oauth: JWKS re-fetched after key rotation; new kid found")
 		}
+	}
+
+	return parsed, keys, nil
+}
+
+// parseAndVerifyExternalJWT parses a compact-serialised JWT, fetches the JWKS
+// for the configured issuer (with a one-shot kid-rotation refresh), and
+// returns the validated claims. Issuer enforcement (singular config.Issuer)
+// and audience enforcement (expectedAudience) both happen here, slash-
+// normalised so a deployment whose issuer config omits the trailing slash
+// matches a token whose `iss` includes it.
+func (v *Verifier) parseAndVerifyExternalJWT(ctx context.Context, token, expectedAudience string) (*Claims, error) {
+	parsed, keys, err := v.parseAndFetchKeys(ctx, token)
+	if err != nil {
+		return nil, err
 	}
 
 	expectedIssuer := strings.TrimRight(strings.TrimSpace(v.cfg.Issuer), "/")
