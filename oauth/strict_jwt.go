@@ -40,6 +40,10 @@ type StrictJWTPolicy struct {
 	// operates at whole-second granularity — any sub-second remainder is
 	// truncated — matching the NumericDate/Unix-timestamp convention used
 	// throughout this package (e.g. validateClaims in oauth/validator.go).
+	// Leeway must not be negative: ValidateStrictJWT rejects a negative
+	// Leeway as an invalid policy before doing any JWKS work, since it could
+	// otherwise integer-overflow the expiry/not-before/issued-at comparisons
+	// in validateStrictRawClaims when combined with an extreme claim value.
 	Leeway time.Duration
 	// RequiredScopes, when non-empty, must all be present in the token's
 	// projected Claims.Scopes (checked via HasRequiredScopes).
@@ -179,7 +183,21 @@ func validateStrictRawClaims(rawClaims map[string]interface{}, policy StrictJWTP
 	if !expPresent || expMalformed {
 		return fmt.Errorf("%w: missing or malformed exp claim", ErrInvalidToken)
 	}
-	if nowUnix > expVal+leewaySecs {
+	// Compare as (nowUnix-leewaySecs) > expVal rather than nowUnix >
+	// expVal+leewaySecs. expVal is an attacker-controlled claim value, and
+	// strictNumericClaim's range check admits the full safe-int64 range —
+	// including the extreme boundary math.MinInt64 — so adding leewaySecs to
+	// it can integer-overflow and wrap around, silently flipping this
+	// comparison (a fail-open expiry bypass). nowUnix (wall-clock "now") and
+	// leewaySecs (bounded by time.Duration's own range, and by
+	// ValidateStrictJWT rejecting a negative Leeway) are both sane,
+	// non-extreme magnitudes, so their difference can't overflow. expVal
+	// itself is never used in arithmetic here — only in comparison — so this
+	// is safe regardless of how extreme expVal is. This is defense in depth:
+	// ValidateStrictJWT's negative-Leeway rejection already prevents the
+	// specific overflow direction that's exploitable, but this comparison
+	// stays overflow-safe on its own regardless of that input validation.
+	if nowUnix-leewaySecs > expVal {
 		return ErrTokenExpired
 	}
 
@@ -255,6 +273,19 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 	}
 	if !hasNonEmptyExpectedAudience(policy.ExpectedAudiences) {
 		return nil, fmt.Errorf("%w: at least one non-empty expected audience is required", ErrInvalidToken)
+	}
+	if policy.Leeway < 0 {
+		// A negative Leeway is a caller configuration error, not an
+		// attacker-controlled input, but it's rejected up front (before any
+		// JWKS work) for the same reason an empty ExpectedAudiences is: it
+		// would otherwise let leewaySecs go negative in
+		// validateStrictRawClaims, which — combined with an extreme (but
+		// currently-accepted-as-a-boundary-value) exp/nbf/iat claim like
+		// math.MinInt64 — could integer-overflow the expiry/not-before/
+		// issued-at arithmetic there and silently flip a rejection into an
+		// acceptance. See validateStrictRawClaims' exp comparison, which is
+		// also hardened independently of this check (defense in depth).
+		return nil, fmt.Errorf("%w: leeway must not be negative", ErrInvalidToken)
 	}
 
 	parsed, keys, err := v.parseAndFetchKeys(ctx, token)

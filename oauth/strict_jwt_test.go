@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -380,6 +381,51 @@ func TestValidateStrictJWT_Expiry(t *testing.T) {
 		})
 		require.ErrorIs(t, err, ErrTokenExpired)
 	})
+
+	// Sabotage case: drop ValidateStrictJWT's negative-Leeway rejection and
+	// this test must go red — an ordinary (non-extreme) expired token, paired
+	// with a negative Leeway, would then be evaluated by
+	// validateStrictRawClaims' exp comparison instead of being rejected
+	// up front as an invalid policy.
+	t.Run("negative leeway is rejected as an invalid policy", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = now.Add(-2 * time.Minute).Unix()
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            -1 * time.Second,
+		})
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
+		require.False(t, errors.Is(err, ErrTokenExpired), "a negative Leeway must be rejected as an invalid policy, not evaluated as an expiry")
+	})
+
+	// Sabotage case: revert the exp comparison in validateStrictRawClaims
+	// back to `nowUnix > expVal+leewaySecs`. exp = math.MinInt64 is an
+	// extreme value that strictNumericClaim's range check currently accepts
+	// as a boundary (not itself rejected as malformed). With a zero or
+	// positive Leeway this test proves the comparison itself doesn't
+	// overflow for any exp/leeway combination admitted by policy validation
+	// — i.e. the defense-in-depth hardening holds independently of the
+	// negative-Leeway rejection above.
+	t.Run("extreme exp boundary does not overflow the comparison with non-negative leeway", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		claims := baseClaims("https://issuer.example.com", "api-1", now)
+		claims["exp"] = math.MinInt64
+		token := idp.sign(claims)
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1"},
+			Leeway:            time.Minute,
+		})
+		require.ErrorIs(t, err, ErrTokenExpired, "an exp of math.MinInt64 must be treated as expired, never accepted via overflow")
+	})
 }
 
 func TestValidateStrictJWT_NotBeforeAndIssuedAt(t *testing.T) {
@@ -482,11 +528,19 @@ func TestValidateStrictJWT_RequiredScopes(t *testing.T) {
 // ErrTransient) must still hold, since that's how callers like the
 // ch-jwt-verify sidecar distinguish "transient, don't negative-cache" from a
 // hard rejection. Sabotage case: forward parseAndFetchKeys' error unchanged
-// from ValidateStrictJWT and this test fails.
+// from ValidateStrictJWT and this test fails. Also captures logged output
+// (same buffer-swap pattern as TestValidateStrictJWT_NoTokenLeakage — not
+// run in parallel with other tests for the same reason: it swaps the shared
+// global zerolog logger) and asserts neither the marker nor the raw token
+// is logged.
 func TestValidateStrictJWT_KidNotFoundDoesNotLeakKid(t *testing.T) {
-	t.Parallel()
 	idp := newStrictTestIdP(t)
 	now := time.Now()
+
+	var logBuf bytes.Buffer
+	origLogger := zlog.Logger
+	zlog.Logger = zerolog.New(&logBuf)
+	defer func() { zlog.Logger = origLogger }()
 
 	// An email-like marker embedded in the kid header, guaranteed not to
 	// appear anywhere else in the token, claims, or JWKS response.
@@ -499,6 +553,10 @@ func TestValidateStrictJWT_KidNotFoundDoesNotLeakKid(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
 	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
+
+	logged := logBuf.String()
+	require.NotContains(t, logged, kidMarker, "ValidateStrictJWT must not log the attacker-controlled kid header value")
+	require.NotContains(t, logged, token, "ValidateStrictJWT must not log the raw compact JWT")
 }
 
 // TestValidateStrictJWT_JWKSFailureWrapsTransient proves point 13: a
