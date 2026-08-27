@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -224,6 +225,26 @@ func TestValidateStrictJWT_AudienceRejections(t *testing.T) {
 			ExpectedAudiences: []string{"api-1"},
 		})
 		require.Error(t, err)
+	})
+
+	// Sabotage case: drop strictAudienceIntersects' whitespace-only-entry
+	// skip (or diverge it from hasNonEmptyExpectedAudience's definition of
+	// "empty") and a token whose only aud value is three spaces would wrongly
+	// match against the unfiltered "   " policy entry, even though it never
+	// matches "api-1" — this test must go red under that sabotage.
+	t.Run("whitespace-only audience entry does not match", func(t *testing.T) {
+		t.Parallel()
+		idp := newStrictTestIdP(t)
+		now := time.Now()
+		// Token's aud is whitespace-only, and deliberately does NOT include
+		// "api-1" — the real entry in the policy below — so a pass here can
+		// only be explained by the "   " entry wrongly matching.
+		token := idp.sign(baseClaims("https://issuer.example.com", "   ", now))
+
+		_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+			ExpectedAudiences: []string{"api-1", "   "},
+		})
+		require.Error(t, err, "a whitespace-only aud claim must not match a whitespace-only policy entry")
 	})
 
 	// Sabotage case: reintroduce audienceMatchesResource-style trailing-slash
@@ -569,6 +590,56 @@ func TestValidateStrictJWT_NoTokenLeakage(t *testing.T) {
 
 	logged := logBuf.String()
 	require.NotContains(t, logged, "TOKEN-MARKER-")
+}
+
+// b64urlNoPad matches the unpadded base64url encoding compact JWT segments
+// use.
+func b64urlNoPad(b []byte) string {
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// rawCompactJWTWithAlg hand-constructs a compact-serialized JWT whose header
+// carries an arbitrary alg value, without going through a jose.Signer (which
+// only accepts alg values from its own known-algorithm enum and would refuse
+// to build a token with an attacker-marker string in that field). go-jose's
+// jwt.ParseSigned parses and validates the header's alg membership before any
+// signature verification happens, so the third segment's content is
+// irrelevant here — it never gets checked when alg itself is already
+// rejected.
+func rawCompactJWTWithAlg(t *testing.T, alg string, claims map[string]interface{}) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]interface{}{"alg": alg, "typ": "JWT"})
+	require.NoError(t, err)
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	return b64urlNoPad(header) + "." + b64urlNoPad(payload) + "." + b64urlNoPad([]byte("not-a-real-signature"))
+}
+
+// TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg proves that when a
+// token's header `alg` isn't in signatureAlgorithms, go-jose's
+// *jose.ErrUnexpectedSignatureAlgorithm — which embeds that raw,
+// attacker-controlled (unverified, pre-signature) alg value in its Error()
+// text — never reaches ValidateStrictJWT's own returned error. Sabotage
+// case: forward parseAndFetchKeys' wrapped parse error unchanged from
+// ValidateStrictJWT (i.e. delete the isUnexpectedSignatureAlgorithmError
+// check) and this test fails.
+func TestValidateStrictJWT_UnexpectedAlgDoesNotLeakAlg(t *testing.T) {
+	t.Parallel()
+	idp := newStrictTestIdP(t)
+	now := time.Now()
+
+	// An email-like marker used as the alg value itself, guaranteed not to
+	// appear anywhere else in the error text.
+	const algMarker = "attacker@leaked-alg.example.com"
+	token := rawCompactJWTWithAlg(t, algMarker, baseClaims("https://issuer.example.com", "api-1", now))
+
+	_, err := idp.verifier.ValidateStrictJWT(context.Background(), token, StrictJWTPolicy{
+		ExpectedAudiences: []string{"api-1"},
+	})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrInvalidToken), "expected ErrInvalidToken, got %v", err)
+	require.False(t, errors.Is(err, ErrTransient), "an unsupported alg is a parse-time rejection, not a transient JWKS/kid failure")
+	require.NotContains(t, err.Error(), algMarker, "ValidateStrictJWT must not leak the attacker-controlled alg header value in its own returned error")
 }
 
 // TestValidateStrictJWT_ExistingCallersUnaffected is a targeted regression

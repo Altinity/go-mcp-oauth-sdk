@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/go-jose/go-jose/v4"
 )
 
 // int64MinAsFloat and int64MaxAsFloat are the safe float64 bounds for
@@ -36,7 +38,10 @@ type StrictJWTPolicy struct {
 	// least one byte-exact match against this list.
 	ExpectedAudiences []string
 	// Leeway bounds the clock-skew tolerance applied to exp/nbf/iat
-	// comparisons. Zero means no tolerance (byte-for-byte "now").
+	// comparisons. Zero means no tolerance (byte-for-byte "now"). Leeway
+	// operates at whole-second granularity — any sub-second remainder is
+	// truncated — matching the NumericDate/Unix-timestamp convention used
+	// throughout this package (e.g. validateClaims in oauth/validator.go).
 	Leeway time.Duration
 	// RequiredScopes, when non-empty, must all be present in the token's
 	// projected Claims.Scopes (checked via HasRequiredScopes).
@@ -87,10 +92,19 @@ func strictAudienceClaim(rawClaims map[string]interface{}) ([]string, error) {
 // at least one byte-exact entry. No substring/prefix matching, no slash
 // trimming — unlike audienceMatchesResource, which is intentionally
 // trailing-slash tolerant for parseAndVerifyExternalJWT's existing callers.
+//
+// Entries that are empty or whitespace-only are skipped when building the
+// expected set, mirroring hasNonEmptyExpectedAudience's definition of
+// "empty" exactly. The two functions must agree: hasNonEmptyExpectedAudience
+// decides whether a policy is valid at all (it requires at least one
+// non-whitespace entry), and if it disagreed with this filter, a policy like
+// ExpectedAudiences: []string{"api-1", "   "} would be accepted as valid
+// (thanks to "api-1") while a token whose only `aud` value is "   " would
+// then wrongly match against the unfiltered "   " entry here.
 func strictAudienceIntersects(tokenAudiences, expected []string) bool {
 	expectedSet := make(map[string]bool, len(expected))
 	for _, e := range expected {
-		if e == "" {
+		if strings.TrimSpace(e) == "" {
 			continue
 		}
 		expectedSet[e] = true
@@ -208,6 +222,20 @@ func isKidNotFoundError(err error) bool {
 	return errors.Is(err, ErrTransient) && strings.HasPrefix(err.Error(), kidNotFoundErrorPrefix)
 }
 
+// isUnexpectedSignatureAlgorithmError reports whether err wraps go-jose's
+// *jose.ErrUnexpectedSignatureAlgorithm — the error jwt.ParseSigned returns
+// (via parseAndFetchKeys in oauth/jwt.go, wrapped as "failed to parse signed
+// JWT: %w") when a token's header `alg` isn't in signatureAlgorithms. That
+// error's Error() method interpolates its Got field verbatim, which go-jose
+// populates directly from the token header — i.e. attacker-controlled,
+// unverified, pre-signature-check content — so, like the kid-not-found case
+// above, ValidateStrictJWT must not let it reach its own returned error
+// unsanitized.
+func isUnexpectedSignatureAlgorithmError(err error) bool {
+	var algErr *jose.ErrUnexpectedSignatureAlgorithm
+	return errors.As(err, &algErr)
+}
+
 // ValidateStrictJWT validates token against policy with byte-exact issuer/
 // audience matching and mandatory exp, in contrast to ValidateToken's
 // soft-pass-on-opaque-bearer and trailing-slash-tolerant behavior. It never
@@ -218,11 +246,20 @@ func isKidNotFoundError(err error) bool {
 // parseAndVerifyExternalJWT relies on (parseAndFetchKeys in oauth/jwt.go);
 // this function adds no separate key-fetching path. Any error from that
 // machinery — including the ErrTransient-wrapped network/discovery/
-// kid-rotation failures — is returned unchanged, with one exception: the
-// "no JWK found for kid %q" case embeds the attacker-controlled (unverified,
-// pre-signature) `kid` header value from the token. That value is stripped
-// before it reaches this function's caller — see the isKidNotFoundError
-// check below — while errors.Is(err, ErrTransient) still holds.
+// kid-rotation failures — is returned unchanged, with two exceptions, both
+// of which embed attacker-controlled (unverified, pre-signature) JWT header
+// content in their Error() text and are sanitized to a fixed message before
+// reaching this function's caller:
+//
+//   - The "no JWK found for kid %q" case embeds the token's `kid` header
+//     value. Stripped below — see the isKidNotFoundError check — while
+//     errors.Is(err, ErrTransient) still holds.
+//   - go-jose's *jose.ErrUnexpectedSignatureAlgorithm (from jwt.ParseSigned,
+//     when the token's `alg` header isn't in signatureAlgorithms) embeds the
+//     token's `alg` header value. Stripped below — see the
+//     isUnexpectedSignatureAlgorithmError check — and reclassified as
+//     ErrInvalidToken, since a parse failure is not one of parseAndFetchKeys'
+//     JWKS-fetch/kid-rotation transient failures.
 //
 // The token string is never included in any returned error or log line.
 func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy StrictJWTPolicy) (*Claims, error) {
@@ -235,6 +272,19 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 
 	parsed, keys, err := v.parseAndFetchKeys(ctx, token)
 	if err != nil {
+		if isUnexpectedSignatureAlgorithmError(err) {
+			// jwt.ParseSigned's *jose.ErrUnexpectedSignatureAlgorithm embeds
+			// the raw, unverified `alg` header value from the token in its
+			// Error() text (see isUnexpectedSignatureAlgorithmError). Unlike
+			// parseAndVerifyExternalJWT's callers (left unchanged — this
+			// check only affects what ValidateStrictJWT itself returns),
+			// ValidateStrictJWT must never let that attacker-controlled
+			// header data reach its own returned-error surface. This is a
+			// parse-time rejection, not one of parseAndFetchKeys' JWKS-fetch/
+			// kid-rotation ErrTransient failures, so it's classified as
+			// ErrInvalidToken rather than ErrTransient.
+			return nil, fmt.Errorf("%w: unsupported or unexpected JWT signature algorithm", ErrInvalidToken)
+		}
 		if isKidNotFoundError(err) {
 			// parseAndFetchKeys' "no JWK found for kid %q" error (oauth/jwt.go)
 			// embeds the raw, unverified `kid` JWT header value in its text.
