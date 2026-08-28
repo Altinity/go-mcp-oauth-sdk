@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/go-jose/go-jose/v4 v4.1.4
-	github.com/modelcontextprotocol/go-sdk v1.6.1
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.53.0
