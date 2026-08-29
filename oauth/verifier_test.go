@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,10 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -384,6 +388,123 @@ func TestJWKSRefetchOnKidMiss(t *testing.T) {
 	claims, err := v.parseAndVerifyExternalJWT(context.Background(), token, "test-audience")
 	require.NoError(t, err)
 	require.Equal(t, "user-1", claims.Subject)
+}
+
+// TestJWKSRotationDoesNotLogKid is the regression test for the kid-leak-on-
+// rotation defect: parseAndFetchKeys' rotation-success log line used to
+// interpolate the raw, unverified `kid` JWT header value via
+// log.Info().Str("kid", keyID) — attacker-controlled bytes taken from the
+// caller-supplied JWT header before any signature verification. This test
+// warms the JWKS cache with a real fetch for a token signed by key A, then
+// rotates the JWKS endpoint to serve only key B — whose kid embeds a
+// distinctive marker, and whose token payload embeds a second, independent
+// marker in `sub` — and validates a token signed by B, forcing the
+// kid-miss re-fetch path in parseAndFetchKeys (oauth/jwt.go) to run. It
+// asserts neither marker appears anywhere in the captured log output, while
+// the fixed rotation-success message is still emitted and the validation
+// result itself is correct (so the test cannot pass vacuously). Not run in
+// parallel: it swaps the shared global zerolog logger (same reason as
+// strict_jwt_test.go's leakage tests).
+func TestJWKSRotationDoesNotLogKid(t *testing.T) {
+	keyA, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	keyB, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	const kidA = "rotation-test-key-a"
+	// kidMarker is embedded in key B's kid header — the unverified, raw
+	// value that must never be logged.
+	const kidMarker = "attacker-marker-kid-rotation@leaked-kid.example.com"
+	kidB := "rotation-test-key-b-" + kidMarker
+	// subMarker is embedded in token B's payload (`sub` claim) — a second,
+	// independent marker. It also doubles as the identity/claims-correctness
+	// assertion below, so the test can't pass vacuously.
+	const subMarker = "user-marker-rotation-payload-9f3c2a"
+
+	var mu sync.Mutex
+	currentKeySet := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{Key: &keyA.PublicKey, KeyID: kidA, Algorithm: "RS256", Use: "sig"},
+	}}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/jwks" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		ks := currentKeySet
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ks)
+	}))
+	defer mockServer.Close()
+
+	v := NewVerifier(OAuthConfig{
+		Issuer:  mockServer.URL,
+		JWKSURL: mockServer.URL + "/jwks",
+	})
+
+	signToken := func(key *rsa.PrivateKey, kid, sub string) string {
+		t.Helper()
+		signer, err := jose.NewSigner(
+			jose.SigningKey{Algorithm: jose.RS256, Key: key},
+			(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
+		)
+		require.NoError(t, err)
+		payload, err := json.Marshal(map[string]interface{}{
+			"sub": sub,
+			"iss": mockServer.URL,
+			"aud": "test-audience",
+			"exp": time.Now().Add(time.Hour).Unix(),
+			"iat": time.Now().Unix(),
+		})
+		require.NoError(t, err)
+		obj, err := signer.Sign(payload)
+		require.NoError(t, err)
+		compact, err := obj.CompactSerialize()
+		require.NoError(t, err)
+		return compact
+	}
+
+	// Warm the cache with key A via a real fetch (not a manually seeded
+	// cache, unlike TestJWKSRefetchOnKidMiss above) — this establishes the
+	// pre-rotation state the log capture below must not disturb.
+	tokenA := signToken(keyA, kidA, "user-a")
+	claimsA, err := v.parseAndVerifyExternalJWT(context.Background(), tokenA, "test-audience")
+	require.NoError(t, err)
+	require.Equal(t, "user-a", claimsA.Subject)
+
+	// Rotate: the JWKS endpoint now serves only key B.
+	mu.Lock()
+	currentKeySet = jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{Key: &keyB.PublicKey, KeyID: kidB, Algorithm: "RS256", Use: "sig"},
+	}}
+	mu.Unlock()
+
+	var logBuf bytes.Buffer
+	origLogger := zlog.Logger
+	origLevel := zerolog.GlobalLevel()
+	zlog.Logger = zerolog.New(&logBuf)
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	defer func() {
+		zlog.Logger = origLogger
+		zerolog.SetGlobalLevel(origLevel)
+	}()
+
+	// key A is still cached with a far-future TTL, so this validation call
+	// is the one that misses on kid B and drives parseAndFetchKeys' cache
+	// invalidation + re-fetch + rotation-success log line.
+	tokenB := signToken(keyB, kidB, subMarker)
+	claimsB, err := v.parseAndVerifyExternalJWT(context.Background(), tokenB, "test-audience")
+	require.NoError(t, err)
+	require.Equal(t, subMarker, claimsB.Subject, "validation result must be correct, not vacuous")
+
+	logged := logBuf.String()
+	require.Contains(t, logged, "oauth: JWKS re-fetched after key rotation; new kid found",
+		"the rotation-success event must still be emitted")
+	require.NotContains(t, logged, kidMarker, "the unverified kid header value must never be logged")
+	require.NotContains(t, logged, kidB, "the full unverified kid header value must never be logged")
+	require.NotContains(t, logged, subMarker, "token payload content must never be logged")
 }
 
 func TestEmailDomain(t *testing.T) {

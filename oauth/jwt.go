@@ -114,7 +114,11 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 				// replica via the negative cache.
 				return nil, nil, fmt.Errorf("no JWK found for kid %q: %w", keyID, ErrTransient)
 			}
-			log.Info().Str("kid", keyID).Msg("oauth: JWKS re-fetched after key rotation; new kid found")
+			// keyID is the unverified `kid` JWT header value supplied by the
+			// caller (arbitrary length/content, not yet authenticated by
+			// anything) — never log it. matched_keys is safe, non-sensitive
+			// numeric context only.
+			log.Info().Int("matched_keys", len(keys)).Msg("oauth: JWKS re-fetched after key rotation; new kid found")
 		}
 	}
 
