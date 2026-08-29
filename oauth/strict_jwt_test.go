@@ -582,6 +582,10 @@ func TestValidateStrictJWT_KidNotFoundDoesNotLeakKid(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
 	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
+	// ValidateStrictJWT's returned text for this case must stay exactly as
+	// documented (coordinator decision), independent of how
+	// parseAndFetchKeys' own internal error text changes.
+	require.Equal(t, "failed to resolve a JWK for the token's key id: transient OAuth validation failure", err.Error())
 
 	logged := logBuf.String()
 	require.NotContains(t, logged, kidMarker, "ValidateStrictJWT must not log the attacker-controlled kid header value")

@@ -264,7 +264,12 @@ func TestParseAndVerifyExternalJWTUnknownKid(t *testing.T) {
 
 	_, err = v.parseAndVerifyExternalJWT(context.Background(), token, "test-audience")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no JWK found for kid")
+	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
+	require.True(t, errors.Is(err, errKidNotFound), "expected errKidNotFound, got %v", err)
+	// The error text is fixed and never embeds the `kid` header value (here
+	// "unknown") — see errKidNotFound's doc comment in oauth/jwt.go.
+	require.NotContains(t, err.Error(), "unknown")
+	require.Contains(t, err.Error(), "no JWK found for token key id")
 }
 
 // TestParseAndVerifyExternalJWTMalformedTokenUnwrapDepth is a regression
