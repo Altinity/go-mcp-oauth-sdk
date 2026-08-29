@@ -80,14 +80,14 @@ func (v *Verifier) ValidateToken(ctx context.Context, token string) (*Claims, er
 // logLegacyValidationFailure logs a parseAndVerifyExternalJWT failure for
 // legacy ValidateToken callers, WITHOUT changing what ValidateToken itself
 // returns (that compatibility contract — see jwt.go's jwtParseFailedPrefix/
-// jwtMissingHeaderText doc comment and strict_jwt.go's errKidNotFound doc
+// jwtMissingHeaderText doc comment and jwt.go's kidNotFoundError doc
 // comment — is untouched by this function). Some of parseAndVerifyExternalJWT's
 // failures embed raw, unverified, pre-signature JWT header content in their
 // Error() text (a malformed/unexpected `alg`, `kid`, `nonce`, or `x5c`
-// header value — see jwtHeaderParseError in jwt.go and errKidNotFound in
-// strict_jwt.go); logging those via log.Error().Err(err) as before would put
-// that attacker-controlled data into the log. This function classifies err
-// into one of four buckets and logs accordingly:
+// header value — see jwtHeaderParseError and kidNotFoundError in jwt.go);
+// logging those via log.Error().Err(err) as before would put that
+// attacker-controlled data into the log. This function classifies err into
+// one of four buckets and logs accordingly:
 //
 //   - header-parse failure (jwt.ParseSigned rejected the token, or its
 //     header was empty) — detected by matching err's fixed literal prefix
@@ -95,11 +95,12 @@ func (v *Verifier) ValidateToken(ctx context.Context, token string) (*Claims, er
 //     content, if any, only ever appears AFTER that fixed prefix, so the
 //     prefix match itself never touches attacker data. Logged as a fixed
 //     message, no Err().
-//   - kid-not-found failure (errKidNotFound, jwt.go) — detected
-//     structurally via errors.Is, not text matching (see errKidNotFound's
-//     doc comment for why this one CAN be structural while the header-parse
-//     case above cannot: parseAndVerifyExternalJWT never strips this
-//     sentinel from what it returns). Logged as a fixed message, no Err().
+//   - kid-not-found failure (*kidNotFoundError, jwt.go) — detected
+//     structurally via isKidNotFoundError (errors.As), not text matching
+//     (see kidNotFoundError's doc comment for why this one CAN be
+//     structural while the header-parse case above cannot:
+//     parseAndVerifyExternalJWT never strips this type from what it
+//     returns). Logged as a fixed message, no Err().
 //   - any other ErrTransient failure — JWKS/discovery network or endpoint
 //     errors (oauth/discovery.go, oauth/jwks.go). These embed operator
 //     configuration (issuer/JWKS URLs) and transport errors, never
@@ -115,7 +116,7 @@ func logLegacyValidationFailure(err error) {
 	switch {
 	case strings.HasPrefix(msg, jwtParseFailedPrefix) || msg == jwtMissingHeaderText:
 		log.Error().Msg("Failed to validate OAuth token: jwt header rejected")
-	case errors.Is(err, errKidNotFound):
+	case isKidNotFoundError(err):
 		log.Error().Msg("Failed to validate OAuth token: no JWK for token key id")
 	case errors.Is(err, ErrTransient):
 		log.Error().Err(err).Msg("Failed to validate OAuth token")

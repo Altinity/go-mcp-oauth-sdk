@@ -83,15 +83,27 @@ const (
 	jwtMissingHeaderText = "missing JWT header"
 )
 
-// errKidNotFound is the structural sentinel for parseAndFetchKeys' "kid
-// still missing after a JIT re-fetch" failure below. It is always returned
-// wrapped alongside ErrTransient (fmt.Errorf("%w: %w", errKidNotFound,
-// ErrTransient)) and its own text is fixed — it never embeds the
-// attacker-controlled `kid` JWT header value. Callers detect this specific
-// case via errors.Is(err, errKidNotFound), not by matching on message text,
-// so the classification stays structural even though the wrapping error's
-// text is deliberately unremarkable.
-var errKidNotFound = errors.New("no JWK found for token key id")
+// kidNotFoundError is the structural sentinel type for parseAndFetchKeys'
+// "kid still missing after a JIT re-fetch" failure below. Its Error() text
+// is fixed and never embeds the attacker-controlled `kid` JWT header value.
+//
+// It is returned as a single value (&kidNotFoundError{}), not wrapped
+// alongside ErrTransient via fmt.Errorf("%w: %w", ...): Go represents a
+// double-%w Errorf as Unwrap() []error, which would make a single
+// errors.Unwrap() return nil instead of ErrTransient — an observable break
+// in the legacy one-step-unwrap compatibility contract (see
+// TestParseAndVerifyExternalJWTUnknownKid in oauth/verifier_test.go, which
+// asserts errors.Unwrap(err) == ErrTransient directly). Instead
+// kidNotFoundError.Unwrap() returns ErrTransient itself, keeping the chain
+// exactly one step deep: kidNotFoundError -> ErrTransient. Callers detect
+// this specific case structurally via isKidNotFoundError (oauth/strict_jwt.go,
+// errors.As against *kidNotFoundError), not by matching on message text, so
+// the classification stays structural even though the error's text is
+// deliberately unremarkable.
+type kidNotFoundError struct{}
+
+func (e *kidNotFoundError) Error() string { return "no JWK found for token key id" }
+func (e *kidNotFoundError) Unwrap() error { return ErrTransient }
 
 // parseAndFetchKeys parses a compact-serialised JWT and resolves the JWKS
 // candidate keys for verifying it: the entries matching the token's `kid`
@@ -148,12 +160,15 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 				// anything), and legacy callers of parseAndVerifyExternalJWT
 				// (oauth/validator.go's ValidateToken) log this error's
 				// Error() text directly via log.Error().Err(err) — so it must
-				// never carry attacker-controlled bytes. errKidNotFound is a
-				// structural marker (detected via errors.Is, not by matching
-				// on message text) that lets isKidNotFoundError
-				// (oauth/strict_jwt.go) and classifyLegacyValidationError
-				// (oauth/validator.go) both recognize this specific case.
-				return nil, nil, fmt.Errorf("%w: %w", errKidNotFound, ErrTransient)
+				// never carry attacker-controlled bytes. kidNotFoundError is
+				// a structural marker (detected via errors.As, not by
+				// matching on message text) that lets isKidNotFoundError
+				// (oauth/strict_jwt.go) and logLegacyValidationFailure
+				// (oauth/validator.go) both recognize this specific case,
+				// while its Unwrap() keeps errors.Is(err, ErrTransient) —
+				// and a single errors.Unwrap() landing on ErrTransient —
+				// true.
+				return nil, nil, &kidNotFoundError{}
 			}
 			// keyID is the unverified `kid` JWT header value supplied by the
 			// caller (arbitrary length/content, not yet authenticated by

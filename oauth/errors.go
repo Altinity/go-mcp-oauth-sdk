@@ -29,7 +29,7 @@ var (
 	// ErrTransient marks a validation failure that callers should NOT treat
 	// as a permanent rejection: network errors fetching JWKS / OIDC
 	// discovery, upstream 5xx, and the kid-still-not-found-after-re-fetch
-	// race (errKidNotFound, oauth/jwt.go) where the IdP's CDN hasn't
+	// race (kidNotFoundError, oauth/jwt.go) where the IdP's CDN hasn't
 	// propagated a freshly-rotated key yet. The
 	// ch-jwt-verify sidecar uses errors.Is(err, ErrTransient) to skip the
 	// negative cache so a one-off blip on one replica doesn't strand a

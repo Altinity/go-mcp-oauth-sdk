@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -830,4 +831,46 @@ func TestValidateStrictJWT_ExistingCallersUnaffected(t *testing.T) {
 		ExpectedAudiences: []string{"api-1"},
 	})
 	require.Error(t, err)
+}
+
+// TestIsKidNotFoundError is a table test for isKidNotFoundError
+// (oauth/strict_jwt.go), which detects parseAndFetchKeys'
+// kid-still-missing-after-re-fetch failure (*kidNotFoundError, oauth/jwt.go)
+// structurally via errors.As rather than by matching Error() text.
+func TestIsKidNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "bare kidNotFoundError",
+			err:  &kidNotFoundError{},
+			want: true,
+		},
+		{
+			name: "kidNotFoundError wrapped once more",
+			err:  fmt.Errorf("validation failed: %w", &kidNotFoundError{}),
+			want: true,
+		},
+		{
+			name: "bare ErrTransient",
+			err:  ErrTransient,
+			want: false,
+		},
+		{
+			name: "ErrInvalidToken",
+			err:  ErrInvalidToken,
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, isKidNotFoundError(tc.err))
+		})
+	}
 }

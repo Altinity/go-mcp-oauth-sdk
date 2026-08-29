@@ -222,15 +222,18 @@ func validateStrictRawClaims(rawClaims map[string]interface{}, policy StrictJWTP
 	return nil
 }
 
-// isKidNotFoundError reports whether err is parseAndFetchKeys' kid-still-
-// missing-after-re-fetch failure (oauth/jwt.go) — the one ErrTransient
-// failure out of parseAndFetchKeys that, prior to the errKidNotFound
-// sentinel, embedded the attacker-controlled `kid` JWT header value in its
-// text. Detection is structural (errors.Is against the errKidNotFound
-// sentinel), not text-matching, so it doesn't depend on — and can't be
-// defeated by a future change to — the error's Error() string.
+// isKidNotFoundError reports whether err is (or wraps) parseAndFetchKeys'
+// kid-still-missing-after-re-fetch failure (*kidNotFoundError, oauth/jwt.go)
+// — the one ErrTransient failure out of parseAndFetchKeys that, prior to
+// that type, embedded the attacker-controlled `kid` JWT header value in its
+// text. Detection is structural (errors.As against *kidNotFoundError), not
+// text-matching, so it doesn't depend on — and can't be defeated by a
+// future change to — the error's Error() string. errors.As also matches
+// when the *kidNotFoundError has since been wrapped one or more additional
+// times, unlike errors.Is against a fixed sentinel value.
 func isKidNotFoundError(err error) bool {
-	return errors.Is(err, errKidNotFound)
+	var kidErr *kidNotFoundError
+	return errors.As(err, &kidErr)
 }
 
 // ValidateStrictJWT validates token against policy with byte-exact issuer/
@@ -250,7 +253,7 @@ func isKidNotFoundError(err error) bool {
 // the source):
 //
 //   - parseAndFetchKeys' kid-still-missing-after-re-fetch failure
-//     (errKidNotFound, oauth/jwt.go) — detected structurally via
+//     (*kidNotFoundError, oauth/jwt.go) — detected structurally via
 //     isKidNotFoundError, not by matching message text. Reclassified below
 //     to this function's own established message while errors.Is(err,
 //     ErrTransient) still holds.
@@ -307,7 +310,7 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 		}
 		if isKidNotFoundError(err) {
 			// parseAndFetchKeys' kid-still-missing-after-re-fetch error
-			// (errKidNotFound, oauth/jwt.go) is detected structurally here,
+			// (*kidNotFoundError, oauth/jwt.go) is detected structurally here,
 			// not by matching its Error() text — and that text is itself
 			// already fixed and attacker-free (it no longer embeds the raw
 			// `kid` JWT header value). Reclassify to ValidateStrictJWT's own

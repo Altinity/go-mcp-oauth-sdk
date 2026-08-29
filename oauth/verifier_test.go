@@ -265,9 +265,14 @@ func TestParseAndVerifyExternalJWTUnknownKid(t *testing.T) {
 	_, err = v.parseAndVerifyExternalJWT(context.Background(), token, "test-audience")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
-	require.True(t, errors.Is(err, errKidNotFound), "expected errKidNotFound, got %v", err)
+	require.True(t, isKidNotFoundError(err), "expected a *kidNotFoundError, got %v", err)
+	// kidNotFoundError.Unwrap() returns ErrTransient directly (not via a
+	// double-%w wrap), so a single errors.Unwrap() must land exactly on
+	// ErrTransient — the legacy one-step-unwrap compatibility contract (see
+	// kidNotFoundError's doc comment in oauth/jwt.go).
+	require.Same(t, ErrTransient, errors.Unwrap(err), "expected a single errors.Unwrap() to land on ErrTransient")
 	// The error text is fixed and never embeds the `kid` header value (here
-	// "unknown") — see errKidNotFound's doc comment in oauth/jwt.go.
+	// "unknown") — see kidNotFoundError's doc comment in oauth/jwt.go.
 	require.NotContains(t, err.Error(), "unknown")
 	require.Contains(t, err.Error(), "no JWK found for token key id")
 }

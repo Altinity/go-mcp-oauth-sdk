@@ -74,7 +74,7 @@ func swapLogger(t *testing.T) *bytes.Buffer {
 // ValidateToken (unlike ValidateStrictJWT, which already had its own
 // dedicated leakage test) does not log the attacker-controlled `kid` JWT
 // header value when parseAndFetchKeys' JIT re-fetch still can't find it
-// (errKidNotFound, oauth/jwt.go). Before logLegacyValidationFailure existed,
+// (*kidNotFoundError, oauth/jwt.go). Before logLegacyValidationFailure existed,
 // ValidateToken's log.Error().Err(err) logged this error's Error() text
 // directly, which — before this fix — embedded the raw kid via
 // fmt.Errorf("no JWK found for kid %q: %w", ...). Sabotage case: revert
