@@ -222,20 +222,18 @@ func validateStrictRawClaims(rawClaims map[string]interface{}, policy StrictJWTP
 	return nil
 }
 
-// kidNotFoundErrorPrefix is the fixed, non-attacker-controlled prefix of the
-// error parseAndFetchKeys (oauth/jwt.go) returns when a JWKS re-fetch still
-// can't find the token's kid. Matching on this fixed prefix (rather than on
-// the error's dynamic %q-quoted kid suffix, which is exactly the part that
-// must never reach ValidateStrictJWT's caller) lets isKidNotFoundError detect
-// this specific case without hardcoding, or otherwise reproducing, any
-// attacker-controlled content.
-const kidNotFoundErrorPrefix = "no JWK found for kid "
-
-// isKidNotFoundError reports whether err is parseAndFetchKeys' "no JWK found
-// for kid %q" error — the one ErrTransient failure out of parseAndFetchKeys
-// that embeds the attacker-controlled `kid` JWT header value in its text.
+// isKidNotFoundError reports whether err is (or wraps) parseAndFetchKeys'
+// kid-still-missing-after-re-fetch failure (*kidNotFoundError, oauth/jwt.go)
+// — the one ErrTransient failure out of parseAndFetchKeys that, prior to
+// that type, embedded the attacker-controlled `kid` JWT header value in its
+// text. Detection is structural (errors.As against *kidNotFoundError), not
+// text-matching, so it doesn't depend on — and can't be defeated by a
+// future change to — the error's Error() string. errors.As also matches
+// when the *kidNotFoundError has since been wrapped one or more additional
+// times, unlike errors.Is against a fixed sentinel value.
 func isKidNotFoundError(err error) bool {
-	return errors.Is(err, ErrTransient) && strings.HasPrefix(err.Error(), kidNotFoundErrorPrefix)
+	var kidErr *kidNotFoundError
+	return errors.As(err, &kidErr)
 }
 
 // ValidateStrictJWT validates token against policy with byte-exact issuer/
@@ -248,14 +246,17 @@ func isKidNotFoundError(err error) bool {
 // parseAndVerifyExternalJWT relies on (parseAndFetchKeys in oauth/jwt.go);
 // this function adds no separate key-fetching path. Any error from that
 // machinery — including the ErrTransient-wrapped network/discovery/
-// kid-rotation failures — is returned unchanged, with two exceptions, both
-// of which may embed attacker-controlled (unverified, pre-signature) JWT
-// header content in their Error() text and are sanitized to a fixed message
-// before reaching this function's caller:
+// kid-rotation failures — is returned unchanged, with two exceptions that
+// this function reclassifies to its own fixed messages below (mostly for a
+// consistent public contract now, rather than leak prevention — both
+// exceptions' underlying Error() text is already fixed and attacker-free at
+// the source):
 //
-//   - The "no JWK found for kid %q" case embeds the token's `kid` header
-//     value. Stripped below — see the isKidNotFoundError check — while
-//     errors.Is(err, ErrTransient) still holds.
+//   - parseAndFetchKeys' kid-still-missing-after-re-fetch failure
+//     (*kidNotFoundError, oauth/jwt.go) — detected structurally via
+//     isKidNotFoundError, not by matching message text. Reclassified below
+//     to this function's own established message while errors.Is(err,
+//     ErrTransient) still holds.
 //   - Any error from parseAndFetchKeys' initial jwt.ParseSigned call or its
 //     header-length check — before any JWKS fetch or kid lookup — is wrapped
 //     in a *jwtHeaderParseError (oauth/jwt.go). go-jose's header-sanitization
@@ -308,13 +309,13 @@ func (v *Verifier) ValidateStrictJWT(ctx context.Context, token string, policy S
 			return nil, fmt.Errorf("%w: unable to parse or validate JWT header", ErrInvalidToken)
 		}
 		if isKidNotFoundError(err) {
-			// parseAndFetchKeys' "no JWK found for kid %q" error (oauth/jwt.go)
-			// embeds the raw, unverified `kid` JWT header value in its text.
-			// That's fine for parseAndVerifyExternalJWT's existing callers
-			// (left unchanged — this check only affects what ValidateStrictJWT
-			// itself returns), but ValidateStrictJWT must never let
-			// attacker-controlled header data reach its own returned-error
-			// surface. Sanitize just this case to a fixed message, preserving
+			// parseAndFetchKeys' kid-still-missing-after-re-fetch error
+			// (*kidNotFoundError, oauth/jwt.go) is detected structurally here,
+			// not by matching its Error() text — and that text is itself
+			// already fixed and attacker-free (it no longer embeds the raw
+			// `kid` JWT header value). Reclassify to ValidateStrictJWT's own
+			// established message anyway, for a stable public contract
+			// independent of parseAndFetchKeys' internal wording, preserving
 			// errors.Is(err, ErrTransient); other ErrTransient failures from
 			// this step (network/discovery/JWKS-endpoint errors) don't embed
 			// attacker data and are returned unchanged.

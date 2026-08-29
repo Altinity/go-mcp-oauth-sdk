@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -69,11 +70,78 @@ func (v *Verifier) ValidateToken(ctx context.Context, token string) (*Claims, er
 	}
 	claims, err := v.parseAndVerifyExternalJWT(ctx, token, v.cfg.Audience)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to validate OAuth token")
+		logLegacyValidationFailure(err)
 		return nil, err
 	}
 
 	return v.validateClaims(claims)
+}
+
+// logLegacyValidationFailure logs a parseAndVerifyExternalJWT failure for
+// legacy ValidateToken callers, WITHOUT changing what ValidateToken itself
+// returns (that compatibility contract — see jwt.go's jwtParseFailedPrefix/
+// jwtMissingHeaderText doc comment and jwt.go's kidNotFoundError doc
+// comment — is untouched by this function). Some of parseAndVerifyExternalJWT's
+// failures embed raw, unverified, pre-signature JWT header content in their
+// Error() text (a malformed/unexpected `alg`, `kid`, `nonce`, or `x5c`
+// header value — see jwtHeaderParseError and kidNotFoundError in jwt.go);
+// logging those via log.Error().Err(err) as before would put that
+// attacker-controlled data into the log. This function classifies err into
+// one of four buckets and logs accordingly:
+//
+//   - header-parse failure (jwt.ParseSigned rejected the token, or its
+//     header was empty) — detected by matching err's fixed literal prefix
+//     (jwtParseFailedPrefix/jwtMissingHeaderText); the attacker-controlled
+//     content, if any, only ever appears AFTER that fixed prefix, so the
+//     prefix match itself never touches attacker data. Logged as a fixed
+//     message, no Err().
+//   - kid-not-found failure (*kidNotFoundError, jwt.go) — detected
+//     structurally via isKidNotFoundError (errors.As), not text matching
+//     (see kidNotFoundError's doc comment for why this one CAN be
+//     structural while the header-parse case above cannot:
+//     parseAndVerifyExternalJWT never strips this type from what it
+//     returns). Logged as a fixed message, no Err().
+//   - any other ErrTransient failure — JWKS/discovery network or endpoint
+//     errors (oauth/discovery.go, oauth/jwks.go). These embed operator
+//     configuration (issuer/JWKS URLs) and transport errors, never
+//     attacker-supplied token content, so they're logged in full via
+//     .Err(err) exactly as before.
+//   - anything else (signature-verification failure, issuer/audience
+//     rejection) — logged as a fixed message plus a fixed string naming
+//     which known sentinel (if any) the error satisfies, never the error's
+//     own Error() text, as defense in depth against a future change to one
+//     of these paths introducing attacker-controlled text.
+func logLegacyValidationFailure(err error) {
+	msg := err.Error()
+	switch {
+	case strings.HasPrefix(msg, jwtParseFailedPrefix) || msg == jwtMissingHeaderText:
+		log.Error().Msg("Failed to validate OAuth token: jwt header rejected")
+	case isKidNotFoundError(err):
+		log.Error().Msg("Failed to validate OAuth token: no JWK for token key id")
+	case errors.Is(err, ErrTransient):
+		log.Error().Err(err).Msg("Failed to validate OAuth token")
+	default:
+		log.Error().Str("class", legacyValidationErrorClass(err)).
+			Msg("Failed to validate OAuth token: token validation failed")
+	}
+}
+
+// legacyValidationErrorClass names the known sentinel err satisfies, for the
+// catch-all branch of logLegacyValidationFailure. A fixed string, never the
+// error's own Error() text.
+func legacyValidationErrorClass(err error) string {
+	switch {
+	case errors.Is(err, ErrInvalidToken):
+		return "ErrInvalidToken"
+	case errors.Is(err, ErrTokenExpired):
+		return "ErrTokenExpired"
+	case errors.Is(err, ErrInsufficientScopes):
+		return "ErrInsufficientScopes"
+	case errors.Is(err, ErrMissingToken):
+		return "ErrMissingToken"
+	default:
+		return "unclassified"
+	}
 }
 
 // validateClaims applies post-signature-verification checks: audience (slash-
@@ -89,11 +157,23 @@ func (v *Verifier) validateClaims(claims *Claims) (*Claims, error) {
 			return nil, ErrInvalidToken
 		}
 		if !audienceMatchesResource(claims.Audience, v.cfg.Audience) {
-			log.Error().Str("expected", v.cfg.Audience).Strs("got", claims.Audience).Msg("OAuth token audience mismatch")
+			// "expected" is operator configuration (safe to log). The old
+			// "got" field logged the token's own audience claim VALUES —
+			// removed; a count is enough to diagnose a mismatch without
+			// putting token-derived strings in the log.
+			log.Error().Str("expected", v.cfg.Audience).Int("got_count", len(claims.Audience)).
+				Msg("OAuth token audience mismatch")
 			return nil, ErrInvalidToken
 		}
 	}
 
+	// exp/nbf/iat are logged as raw numeric timestamps (never as strings)
+	// deliberately: unlike the audience/scope claim VALUES removed below,
+	// these are needed for clock-skew diagnosis and, because they're read
+	// from a claims map claimsFromRawClaims already produced from a
+	// signature-verified token by the time validateClaims runs, they carry
+	// no unverified/attacker-controlled content — a signature-verified
+	// integer timestamp isn't the kind of string data this change targets.
 	now := time.Now().Unix()
 	if claims.ExpiresAt > 0 && now > claims.ExpiresAt+clockSkewSecs {
 		log.Error().Int64("exp", claims.ExpiresAt).Msg("OAuth token expired")
@@ -110,7 +190,12 @@ func (v *Verifier) validateClaims(claims *Claims) (*Claims, error) {
 
 	if len(v.cfg.RequiredScopes) > 0 {
 		if !HasRequiredScopes(claims.Scopes, v.cfg.RequiredScopes) {
-			log.Error().Strs("required", v.cfg.RequiredScopes).Strs("got", claims.Scopes).Msg("OAuth token missing required scopes")
+			// "required" is operator configuration (safe to log). The old
+			// "got" field logged the token's own scope claim VALUES —
+			// removed in favor of a count, same rationale as the audience
+			// mismatch above.
+			log.Error().Strs("required", v.cfg.RequiredScopes).Int("got_count", len(claims.Scopes)).
+				Msg("OAuth token missing required scopes")
 			return nil, ErrInsufficientScopes
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -582,6 +583,10 @@ func TestValidateStrictJWT_KidNotFoundDoesNotLeakKid(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTransient), "expected ErrTransient, got %v", err)
 	require.NotContains(t, err.Error(), kidMarker, "ValidateStrictJWT must not leak the attacker-controlled kid header value in its own returned error")
+	// ValidateStrictJWT's returned text for this case must stay exactly as
+	// documented (coordinator decision), independent of how
+	// parseAndFetchKeys' own internal error text changes.
+	require.Equal(t, "failed to resolve a JWK for the token's key id: transient OAuth validation failure", err.Error())
 
 	logged := logBuf.String()
 	require.NotContains(t, logged, kidMarker, "ValidateStrictJWT must not log the attacker-controlled kid header value")
@@ -826,4 +831,46 @@ func TestValidateStrictJWT_ExistingCallersUnaffected(t *testing.T) {
 		ExpectedAudiences: []string{"api-1"},
 	})
 	require.Error(t, err)
+}
+
+// TestIsKidNotFoundError is a table test for isKidNotFoundError
+// (oauth/strict_jwt.go), which detects parseAndFetchKeys'
+// kid-still-missing-after-re-fetch failure (*kidNotFoundError, oauth/jwt.go)
+// structurally via errors.As rather than by matching Error() text.
+func TestIsKidNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "bare kidNotFoundError",
+			err:  &kidNotFoundError{},
+			want: true,
+		},
+		{
+			name: "kidNotFoundError wrapped once more",
+			err:  fmt.Errorf("validation failed: %w", &kidNotFoundError{}),
+			want: true,
+		},
+		{
+			name: "bare ErrTransient",
+			err:  ErrTransient,
+			want: false,
+		},
+		{
+			name: "ErrInvalidToken",
+			err:  ErrInvalidToken,
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, isKidNotFoundError(tc.err))
+		})
+	}
 }

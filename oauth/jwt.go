@@ -64,6 +64,47 @@ type jwtHeaderParseError struct{ err error }
 func (e *jwtHeaderParseError) Error() string { return e.err.Error() }
 func (e *jwtHeaderParseError) Unwrap() error { return e.err }
 
+// jwtParseFailedPrefix and jwtMissingHeaderText are the two fixed, literal
+// error texts jwtHeaderParseError wraps (see parseAndFetchKeys below).
+// parseAndVerifyExternalJWT deliberately strips the jwtHeaderParseError
+// wrapper type before returning to its own callers (preserving the exact
+// pre-jwtHeaderParseError object graph legacy callers depend on — see
+// TestParseAndVerifyExternalJWTMalformedTokenUnwrapDepth in
+// oauth/verifier_test.go, which asserts errors.As for *jwtHeaderParseError
+// is false and that a single errors.Unwrap() lands directly on the raw
+// go-jose error), so no structural (errors.Is/errors.As) sentinel survives
+// on the error validator.go's legacy ValidateToken receives for this class.
+// classifyLegacyValidationError (oauth/validator.go) instead matches on
+// these fixed literal prefixes — safe because they are our own constant
+// format-string text, never influenced by the attacker-controlled JWT
+// header content that %w substitutes in afterward.
+const (
+	jwtParseFailedPrefix = "failed to parse signed JWT:"
+	jwtMissingHeaderText = "missing JWT header"
+)
+
+// kidNotFoundError is the structural sentinel type for parseAndFetchKeys'
+// "kid still missing after a JIT re-fetch" failure below. Its Error() text
+// is fixed and never embeds the attacker-controlled `kid` JWT header value.
+//
+// It is returned as a single value (&kidNotFoundError{}), not wrapped
+// alongside ErrTransient via fmt.Errorf("%w: %w", ...): Go represents a
+// double-%w Errorf as Unwrap() []error, which would make a single
+// errors.Unwrap() return nil instead of ErrTransient — an observable break
+// in the legacy one-step-unwrap compatibility contract (see
+// TestParseAndVerifyExternalJWTUnknownKid in oauth/verifier_test.go, which
+// asserts errors.Unwrap(err) == ErrTransient directly). Instead
+// kidNotFoundError.Unwrap() returns ErrTransient itself, keeping the chain
+// exactly one step deep: kidNotFoundError -> ErrTransient. Callers detect
+// this specific case structurally via isKidNotFoundError (oauth/strict_jwt.go,
+// errors.As against *kidNotFoundError), not by matching on message text, so
+// the classification stays structural even though the error's text is
+// deliberately unremarkable.
+type kidNotFoundError struct{}
+
+func (e *kidNotFoundError) Error() string { return "no JWK found for token key id" }
+func (e *kidNotFoundError) Unwrap() error { return ErrTransient }
+
 // parseAndFetchKeys parses a compact-serialised JWT and resolves the JWKS
 // candidate keys for verifying it: the entries matching the token's `kid`
 // header (with a one-shot cache-bypass re-fetch on a kid miss, to tolerate
@@ -80,10 +121,10 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 
 	parsed, err := jwt.ParseSigned(token, signatureAlgorithms)
 	if err != nil {
-		return nil, nil, &jwtHeaderParseError{err: fmt.Errorf("failed to parse signed JWT: %w", err)}
+		return nil, nil, &jwtHeaderParseError{err: fmt.Errorf("%s %w", jwtParseFailedPrefix, err)}
 	}
 	if len(parsed.Headers) == 0 {
-		return nil, nil, &jwtHeaderParseError{err: fmt.Errorf("missing JWT header")}
+		return nil, nil, &jwtHeaderParseError{err: errors.New(jwtMissingHeaderText)}
 	}
 
 	keySet, err := v.fetchJWKSet(ctx, jwksURI)
@@ -112,9 +153,28 @@ func (v *Verifier) parseAndFetchKeys(ctx context.Context, token string) (*jwt.JS
 				// sidecar treats this as transient so a multi-replica
 				// rotation race doesn't pin a real token as bad on one
 				// replica via the negative cache.
-				return nil, nil, fmt.Errorf("no JWK found for kid %q: %w", keyID, ErrTransient)
+				//
+				// The error text is FIXED and never embeds keyID: it is the
+				// unverified `kid` JWT header value supplied by the caller
+				// (arbitrary length/content, not yet authenticated by
+				// anything), and legacy callers of parseAndVerifyExternalJWT
+				// (oauth/validator.go's ValidateToken) log this error's
+				// Error() text directly via log.Error().Err(err) — so it must
+				// never carry attacker-controlled bytes. kidNotFoundError is
+				// a structural marker (detected via errors.As, not by
+				// matching on message text) that lets isKidNotFoundError
+				// (oauth/strict_jwt.go) and logLegacyValidationFailure
+				// (oauth/validator.go) both recognize this specific case,
+				// while its Unwrap() keeps errors.Is(err, ErrTransient) —
+				// and a single errors.Unwrap() landing on ErrTransient —
+				// true.
+				return nil, nil, &kidNotFoundError{}
 			}
-			log.Info().Str("kid", keyID).Msg("oauth: JWKS re-fetched after key rotation; new kid found")
+			// keyID is the unverified `kid` JWT header value supplied by the
+			// caller (arbitrary length/content, not yet authenticated by
+			// anything) — never log it. matched_keys is safe, non-sensitive
+			// numeric context only.
+			log.Info().Int("matched_keys", len(keys)).Msg("oauth: JWKS re-fetched after key rotation; new kid found")
 		}
 	}
 
